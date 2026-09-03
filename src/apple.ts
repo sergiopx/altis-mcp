@@ -332,6 +332,8 @@ export async function checkRankBatch(
   const results: BatchItemResult[] = [];
   const summary: BatchSummary = { total: terms.length * countries.length, ok: 0, failed: 0, skipped: 0, rateLimitHits: 0, durationMs: 0 };
   let done = 0;
+  // Tracked per batch: the shared limiter's counter resets on any successful call in the process.
+  let consecutiveRateLimits = 0;
 
   outer: for (const country of countries) {
     for (const term of terms) {
@@ -353,18 +355,20 @@ export async function checkRankBatch(
         try {
           const r = await checkRank(term, appId, country, opts.depth ?? 200, { signal: opts.signal, paceMs: opts.paceMs });
           item = { ...r, attempts };
+          consecutiveRateLimits = 0;
           break;
         } catch (e) {
           if (opts.signal?.aborted) throw e;
           lastError = e instanceof Error ? e.message : String(e);
           if (e instanceof AppleRateLimitError) {
             summary.rateLimitHits += 1;
+            consecutiveRateLimits += 1;
             rateLimited = true;
             // The limiter has armed its backoff; the next acquire() waits it out. Don't count against retries.
             attempts -= 1;
-            if (appleLimiter.status().consecutiveRateLimits >= MAX_CONSECUTIVE_RATE_LIMITS) {
+            if (consecutiveRateLimits >= MAX_CONSECUTIVE_RATE_LIMITS) {
               // Roughly half an hour of straight 403s: stop the whole batch. Completed terms are already persisted.
-              summary.aborted = `Stopped after ${appleLimiter.status().consecutiveRateLimits} consecutive rate-limit responses; retry later (see rate_status)`;
+              summary.aborted = `Stopped after ${consecutiveRateLimits} consecutive rate-limit responses; retry later (see rate_status)`;
               break;
             }
           }

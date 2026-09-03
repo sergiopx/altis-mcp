@@ -232,26 +232,41 @@ export interface WalInfo {
   walMtime: string | null;
 }
 
+function fileStamp(p: string): string {
+  if (!existsSync(p)) return "missing";
+  const st = statSync(p);
+  return `${st.size}:${st.mtimeMs}`;
+}
+
 /**
  * Copy the SQLite main file and its WAL/SHM siblings into a fresh temp dir.
+ * Altis may be writing concurrently, so the copy is retried when the WAL
+ * changed while we were copying (a torn snapshot). SQLite ignores a partial
+ * trailing WAL frame, but main-file/WAL skew is avoided outright this way.
  * Returns the copied main-file path, the temp dir, and WAL size for diagnostics.
  */
-export function snapshotStore(path: string): { copyPath: string; dir: string; wal: WalInfo } {
+export function snapshotStore(path: string, maxAttempts = 4): { copyPath: string; dir: string; wal: WalInfo } {
   const dir = mkdtempSync(join(tmpdir(), "altis-mcp-"));
   const name = basename(path);
-  let walBytes = 0;
-  let walMtime: string | null = null;
-  for (const suffix of ["", "-wal", "-shm"]) {
-    const src = path + suffix;
-    if (!existsSync(src)) continue;
-    copyFileSync(src, join(dir, name + suffix));
-    if (suffix === "-wal") {
-      const st = statSync(src);
-      walBytes = st.size;
-      walMtime = st.mtime.toISOString();
+  for (let attempt = 1; ; attempt++) {
+    const before = [path, path + "-wal"].map(fileStamp).join("|");
+    for (const suffix of ["", "-wal", "-shm"]) {
+      const src = path + suffix;
+      if (existsSync(src)) copyFileSync(src, join(dir, name + suffix));
+      else rmSync(join(dir, name + suffix), { force: true });
+    }
+    const after = [path, path + "-wal"].map(fileStamp).join("|");
+    if (before === after || attempt >= maxAttempts) {
+      let walBytes = 0;
+      let walMtime: string | null = null;
+      if (existsSync(path + "-wal")) {
+        const st = statSync(path + "-wal");
+        walBytes = st.size;
+        walMtime = st.mtime.toISOString();
+      }
+      return { copyPath: join(dir, name), dir, wal: { copied: true, walBytes, walMtime } };
     }
   }
-  return { copyPath: join(dir, name), dir, wal: { copied: true, walBytes, walMtime } };
 }
 
 export class AltisStore {

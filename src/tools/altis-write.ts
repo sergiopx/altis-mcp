@@ -69,7 +69,7 @@ export function registerAltisWriteTools(server: McpServer): void {
         `${FREE_PLAN_LIMIT}-slot free-plan limit read from the store, and verification of the store count afterwards. Returns { before, after, changed, skipped }. Never writes to the SQLite store.`,
       inputSchema: {
         appId: z.number().int().describe("Altis app id from altis_list_apps"),
-        keywords: z.array(z.string().min(1)).min(1).max(FREE_PLAN_LIMIT),
+        keywords: z.array(z.string().min(1).refine((k) => !k.includes(","), "keywords cannot contain commas")).min(1).max(FREE_PLAN_LIMIT),
         country: z.string().length(2).optional().describe("Informational; Altis adds to the app's active country"),
         allowOverLimit: z.boolean().optional().default(false).describe("Skip the 30-slot guard (paid plan)"),
         dryRun: z.boolean().optional().default(false).describe("Run guards and dedupe only; click nothing"),
@@ -94,10 +94,12 @@ export function registerAltisWriteTools(server: McpServer): void {
         const nowTracked = withStore((s) => s.trackedTexts(appId));
         const changed = fresh.filter((k) => nowTracked.has(k.toLowerCase()));
         const missing = fresh.filter((k) => !nowTracked.has(k.toLowerCase()));
-        const ok = after === before + fresh.length && missing.length === 0;
-        return ok
-          ? json({ ...plan, after, changed })
-          : fail(JSON.stringify({ error: `Store count is ${after}, expected ${before + fresh.length}; some keywords may not have been added`, before, after, changed, missing }));
+        if (missing.length) {
+          return fail(JSON.stringify({ error: `${missing.length} keyword(s) not found in the store after the add`, before, after, changed, missing }));
+        }
+        // Every requested keyword is present; a count that differs from the expectation means Altis (e.g. an Explore agent) changed something else meanwhile.
+        const warning = after === before + fresh.length ? undefined : `Store count is ${after}, expected ${before + fresh.length}; other keywords changed concurrently`;
+        return json({ ...plan, after, changed, ...(warning ? { warning } : {}) });
       } catch (e) {
         return fail(e);
       }
@@ -110,7 +112,7 @@ export function registerAltisWriteTools(server: McpServer): void {
       title: "Delete keywords from Altis",
       description:
         "Delete keywords from a tracked app in Altis through UI automation, one at a time: clear selection, select exactly that row, click 'Delete Selected' (coordinate click), confirm, " +
-        "then verify the store count dropped by exactly 1 before continuing. Stops at the first anomaly. Altis must be running and frontmost with no dialog open. Returns { before, after, changed, notFound }.",
+        "then verify against the store that the keyword is gone and the count dropped by exactly 1 before continuing. Stops if a keyword survives or more than one row disappears. Altis must be running and frontmost with no dialog open. Returns { before, after, changed, notFound }.",
       inputSchema: {
         appId: z.number().int().describe("Altis app id from altis_list_apps"),
         keywords: z.array(z.string().min(1)).min(1).max(100),
@@ -130,6 +132,7 @@ export function registerAltisWriteTools(server: McpServer): void {
         if (dryRun) return json({ ...plan, dryRun: true });
 
         const changed: string[] = [];
+        const warnings: string[] = [];
         let current = before;
         for (const kw of present) {
           if (await hasOpenSheetOrDialog()) return fail(JSON.stringify({ error: "A dialog opened unexpectedly; stopping", before, after: current, changed }));
@@ -142,13 +145,19 @@ export function registerAltisWriteTools(server: McpServer): void {
           await clickAt(deleteButtonPoint(bounds, bannerVisible));
           await clickAt(confirmButtonPoint(bounds));
           const after = await waitForCount(appId, current - 1);
-          if (after !== current - 1) {
-            return fail(JSON.stringify({ error: `Deleting '${kw}' changed the count from ${current} to ${after} (expected ${current - 1}); stopping`, before, after, changed }));
+          const stillThere = withStore((s) => s.trackedTexts(appId)).has(kw);
+          if (stillThere) {
+            return fail(JSON.stringify({ error: `'${kw}' is still tracked after the delete click; stopping`, before, after, changed }));
           }
+          if (after < current - 1) {
+            // More rows vanished than the one we selected: stop before anything else is lost.
+            return fail(JSON.stringify({ error: `Deleting '${kw}' changed the count from ${current} to ${after} (expected ${current - 1}); stopping`, before, after, changed: [...changed, kw] }));
+          }
+          if (after !== current - 1) warnings.push(`After deleting '${kw}' the count is ${after}, expected ${current - 1}; other keywords changed concurrently`);
           current = after;
           changed.push(kw);
         }
-        return json({ ...plan, after: current, changed });
+        return json({ ...plan, after: current, changed, ...(warnings.length ? { warnings } : {}) });
       } catch (e) {
         return fail(e);
       }
