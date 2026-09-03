@@ -1,9 +1,11 @@
 /**
- * Live App Store data. These are the same public Apple endpoints Altis itself
- * uses (itunes.apple.com/search, /lookup and the MZSearchHints suggestions feed).
+ * Apple public App Store endpoints (no auth): search, lookup, autocomplete
+ * hints and rank checks built on top of them. Every request goes through the
+ * shared rate limiter so pacing and backoff hold across all tools.
  */
+import { AppleRateLimitError, appleLimiter } from "./ratelimit.js";
 
-const UA = "altis-mcp/0.1 (+https://tryaltis.com)";
+const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 
 export interface AppResult {
   trackId: number;
@@ -28,9 +30,26 @@ interface SearchResponse {
   results: AppResult[];
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, { headers: { "User-Agent": UA, Accept: "application/json" } });
+export interface FetchOptions {
+  signal?: AbortSignal;
+  paceMs?: number;
+}
+
+/** Fetch through the limiter; 403/429 become AppleRateLimitError and arm the backoff. */
+async function limitedFetch(endpoint: string, url: string, init: RequestInit, opts: FetchOptions = {}): Promise<Response> {
+  await appleLimiter.acquire(endpoint, { signal: opts.signal, paceMs: opts.paceMs });
+  const res = await fetch(url, { ...init, signal: opts.signal });
+  if (res.status === 403 || res.status === 429) {
+    const wait = appleLimiter.recordRateLimit(endpoint, res.status, res.headers.get("retry-after"));
+    throw new AppleRateLimitError(endpoint, res.status, wait, url);
+  }
   if (!res.ok) throw new Error(`Apple API ${res.status} for ${url}`);
+  appleLimiter.recordSuccess(endpoint);
+  return res;
+}
+
+async function fetchJson<T>(endpoint: string, url: string, opts?: FetchOptions): Promise<T> {
+  const res = await limitedFetch(endpoint, url, { headers: { "User-Agent": UA, Accept: "application/json" } }, opts);
   return (await res.json()) as T;
 }
 
@@ -54,37 +73,39 @@ function slim(a: AppResult, withDescription = false): AppResult {
   };
 }
 
-export async function searchApps(term: string, country = "us", limit = 25): Promise<AppResult[]> {
+export async function searchApps(term: string, country = "us", limit = 25, opts?: FetchOptions): Promise<AppResult[]> {
   const url = new URL("https://itunes.apple.com/search");
   url.searchParams.set("term", term);
   url.searchParams.set("media", "software");
   url.searchParams.set("entity", "software");
   url.searchParams.set("country", country.toLowerCase());
   url.searchParams.set("limit", String(Math.min(Math.max(limit, 1), 200)));
-  const data = await fetchJson<SearchResponse>(url.toString());
+  const data = await fetchJson<SearchResponse>("search", url.toString(), opts);
   return data.results.map((a) => slim(a));
 }
 
-export async function lookupApp(id: string, country = "us"): Promise<AppResult | null> {
+export async function lookupApp(id: string, country = "us", opts?: FetchOptions): Promise<AppResult | null> {
   const url = new URL("https://itunes.apple.com/lookup");
   if (/^\d+$/.test(id)) url.searchParams.set("id", id);
   else url.searchParams.set("bundleId", id);
   url.searchParams.set("country", country.toLowerCase());
   url.searchParams.set("entity", "software");
-  const data = await fetchJson<SearchResponse>(url.toString());
+  const data = await fetchJson<SearchResponse>("lookup", url.toString(), opts);
   return data.results[0] ? slim(data.results[0], true) : null;
 }
 
 /** App Store search-bar autocomplete suggestions for a term. */
-export async function searchHints(term: string, country = "us"): Promise<string[]> {
+export async function searchHints(term: string, country = "us", opts?: FetchOptions): Promise<string[]> {
   const url = new URL("https://search.itunes.apple.com/WebObjects/MZSearchHints.woa/wa/hints");
   url.searchParams.set("clientApplication", "Software");
   url.searchParams.set("term", term);
   const storefront = STOREFRONTS[country.toUpperCase()] ?? STOREFRONTS.US;
-  const res = await fetch(url.toString(), {
-    headers: { "User-Agent": UA, "X-Apple-Store-Front": `${storefront}-1,29` },
-  });
-  if (!res.ok) throw new Error(`Apple hints API ${res.status}`);
+  const res = await limitedFetch(
+    "hints",
+    url.toString(),
+    { headers: { "User-Agent": UA, "X-Apple-Store-Front": `${storefront}-1,29` } },
+    opts,
+  );
   const xml = await res.text();
   // Response is an XML plist; hint terms are <key>term</key><string>...</string>.
   const out: string[] = [];
@@ -103,34 +124,257 @@ function decodeXml(s: string): string {
     .replace(/&#39;/g, "'");
 }
 
+// ---------------------------------------------------------------- app-name detection
+
+/** Lowercase, strip punctuation, collapse whitespace: "1RM Club: Rep Calc" -> "1rm club rep calc". */
+export function normalizeTerm(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+const TITLE_SEPARATORS = [" - ", ": ", " | ", " – ", " — ", " · "];
+
+function hasSeparator(s: string): boolean {
+  return TITLE_SEPARATORS.some((sep) => s.includes(sep));
+}
+
+/**
+ * Whether an autocomplete suggestion looks like an app title rather than a
+ * query. True when it contains a title separator, or when (normalized) it
+ * equals a known app title or is the head of a titled app ("barload plate
+ * calculator" for "BarLoad Plate Calculator - Gym") AND it is not generic: a
+ * generic phrase ("plate calculator") also appears as a word sequence inside
+ * two or more other titles ("Barbell Plate Calculator", "Plate Calculator Pro").
+ * The flag is advisory; the screen tool reports what it dropped.
+ */
+export function looksLikeAppName(suggestion: string, knownNames: Iterable<string>): boolean {
+  if (hasSeparator(suggestion)) return true;
+  const norm = normalizeTerm(suggestion);
+  if (!norm) return false;
+  const titles = new Set<string>();
+  let exact = false;
+  let titledHead = false;
+  for (const name of knownNames) {
+    const n = normalizeTerm(name);
+    if (!n) continue;
+    titles.add(n);
+    if (n === norm) exact = true;
+    else if (hasSeparator(name) && n.startsWith(norm + " ")) titledHead = true;
+  }
+  if (!exact && !titledHead) return false;
+  const needle = ` ${norm} `;
+  let containers = 0;
+  for (const t of titles) if (t !== norm && ` ${t} `.includes(needle)) containers += 1;
+  return containers < 2; // a phrase used inside several other titles is a generic query, not a title
+}
+
+// ---------------------------------------------------------------- rank checks
+
+export interface TopApp {
+  position: number;
+  trackId: number;
+  bundleId: string;
+  trackName: string;
+  primaryGenreName: string;
+  userRatingCount?: number;
+  averageUserRating?: number;
+  releaseDate?: string;
+  currentVersionReleaseDate?: string;
+}
+
+export interface Top10Summary {
+  count: number;
+  maxReviews: number | null;
+  sumReviews: number | null;
+  avgRating: number | null;
+  newestAgeDays: number | null;
+  medianAgeDays: number | null;
+  dominantGenre: string | null;
+}
+
 export interface RankResult {
   term: string;
   country: string;
   appId: string;
   position: number | null;
   checkedTop: number;
-  topApps: Array<{ position: number; trackId: number; trackName: string; userRatingCount?: number; averageUserRating?: number }>;
+  topApps: TopApp[];
+  top10: Top10Summary;
+  checkedAt: string;
 }
 
-/** Position of an app (numeric id or bundle id) in search results for a term. */
-export async function checkRank(term: string, appId: string, country = "us", depth = 200): Promise<RankResult> {
-  const results = await searchApps(term, country, depth);
+function ageDays(iso: string | undefined, now: number): number | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? null : Math.max(0, Math.round((now - t) / 86_400_000));
+}
+
+function median(xs: number[]): number | null {
+  if (!xs.length) return null;
+  const s = [...xs].sort((a, b) => a - b);
+  const mid = s.length >> 1;
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+}
+
+/** Scoring inputs over the top apps: reviews, rating, ages (from releaseDate), dominant genre. */
+export function summarizeTop10(
+  apps: Array<{ userRatingCount?: number | null; averageUserRating?: number | null; releaseDate?: string | null; primaryGenreName?: string | null }>,
+  now = Date.now(),
+): Top10Summary {
+  const reviews = apps.map((a) => a.userRatingCount).filter((n): n is number => typeof n === "number");
+  const ratings = apps.map((a) => a.averageUserRating).filter((n): n is number => typeof n === "number");
+  const ages = apps.map((a) => ageDays(a.releaseDate ?? undefined, now)).filter((n): n is number => n !== null);
+  const genres = new Map<string, number>();
+  for (const a of apps) if (a.primaryGenreName) genres.set(a.primaryGenreName, (genres.get(a.primaryGenreName) ?? 0) + 1);
+  let dominantGenre: string | null = null;
+  let best = 0;
+  for (const [g, n] of genres) if (n > best) ([dominantGenre, best] = [g, n]);
+  return {
+    count: apps.length,
+    maxReviews: reviews.length ? Math.max(...reviews) : null,
+    sumReviews: reviews.length ? reviews.reduce((a, b) => a + b, 0) : null,
+    avgRating: ratings.length ? Math.round((ratings.reduce((a, b) => a + b, 0) / ratings.length) * 100) / 100 : null,
+    newestAgeDays: ages.length ? Math.min(...ages) : null,
+    medianAgeDays: median(ages),
+    dominantGenre,
+  };
+}
+
+/** Index of an app (numeric id or bundle id) in a result list, or -1. */
+export function findApp(results: AppResult[], appId: string): number {
   const isNumeric = /^\d+$/.test(appId);
-  const idx = results.findIndex((a) => (isNumeric ? String(a.trackId) === appId : a.bundleId === appId));
+  return results.findIndex((a) => (isNumeric ? String(a.trackId) === appId : a.bundleId === appId));
+}
+
+/** Build a RankResult from an already-fetched SERP. */
+export function rankFromResults(term: string, appId: string, country: string, results: AppResult[]): RankResult {
+  const idx = findApp(results, appId);
+  const topApps: TopApp[] = results.slice(0, 10).map((a, i) => ({
+    position: i + 1,
+    trackId: a.trackId,
+    bundleId: a.bundleId,
+    trackName: a.trackName,
+    primaryGenreName: a.primaryGenreName,
+    userRatingCount: a.userRatingCount,
+    averageUserRating: a.averageUserRating,
+    releaseDate: a.releaseDate,
+    currentVersionReleaseDate: a.currentVersionReleaseDate,
+  }));
   return {
     term,
     country: country.toUpperCase(),
     appId,
     position: idx >= 0 ? idx + 1 : null,
     checkedTop: results.length,
-    topApps: results.slice(0, 10).map((a, i) => ({
-      position: i + 1,
-      trackId: a.trackId,
-      trackName: a.trackName,
-      userRatingCount: a.userRatingCount,
-      averageUserRating: a.averageUserRating,
-    })),
+    topApps,
+    top10: summarizeTop10(topApps),
+    checkedAt: new Date().toISOString(),
   };
+}
+
+/** Position of an app (numeric id or bundle id) in search results for a term. */
+export async function checkRank(term: string, appId: string, country = "us", depth = 200, opts?: FetchOptions): Promise<RankResult> {
+  const results = await searchApps(term, country, depth, opts);
+  return rankFromResults(term, appId, country, results);
+}
+
+export interface BatchItemResult extends Partial<RankResult> {
+  term: string;
+  country: string;
+  appId: string;
+  attempts: number;
+  error?: string;
+  rateLimited?: boolean;
+}
+
+export interface BatchOptions {
+  countries?: string[];
+  depth?: number;
+  paceMs?: number;
+  /** Attempts per term before recording an error (rate limits are retried after backoff). */
+  maxRetries?: number;
+  signal?: AbortSignal;
+  /** Called as each term completes (success or final failure); use it to persist or report progress. */
+  onResult?: (r: BatchItemResult, done: number, total: number) => void | Promise<void>;
+  /** Skip a term×country before fetching (e.g. checked recently). Return a cached result to emit it instead. */
+  skip?: (term: string, country: string) => BatchItemResult | null | undefined;
+}
+
+export interface BatchSummary {
+  total: number;
+  ok: number;
+  failed: number;
+  skipped: number;
+  rateLimitHits: number;
+  durationMs: number;
+}
+
+/**
+ * Sequential paced rank checks over terms × countries. Rate-limit responses
+ * wait out the limiter's backoff and retry; other errors retry up to maxRetries.
+ */
+export async function checkRankBatch(
+  terms: string[],
+  appId: string,
+  opts: BatchOptions = {},
+): Promise<{ results: BatchItemResult[]; summary: BatchSummary }> {
+  const countries = (opts.countries?.length ? opts.countries : ["us"]).map((c) => c.toUpperCase());
+  const maxRetries = opts.maxRetries ?? 5;
+  const started = Date.now();
+  const results: BatchItemResult[] = [];
+  const summary: BatchSummary = { total: terms.length * countries.length, ok: 0, failed: 0, skipped: 0, rateLimitHits: 0, durationMs: 0 };
+  let done = 0;
+
+  for (const country of countries) {
+    for (const term of terms) {
+      if (opts.signal?.aborted) throw opts.signal.reason instanceof Error ? opts.signal.reason : new Error("Batch aborted");
+      const cached = opts.skip?.(term, country);
+      if (cached) {
+        summary.skipped += 1;
+        results.push(cached);
+        done += 1;
+        await opts.onResult?.(cached, done, summary.total);
+        continue;
+      }
+      let item: BatchItemResult | null = null;
+      let attempts = 0;
+      let lastError = "";
+      let rateLimited = false;
+      while (attempts < maxRetries) {
+        attempts += 1;
+        try {
+          const r = await checkRank(term, appId, country, opts.depth ?? 200, { signal: opts.signal, paceMs: opts.paceMs });
+          item = { ...r, attempts };
+          break;
+        } catch (e) {
+          if (opts.signal?.aborted) throw e;
+          lastError = e instanceof Error ? e.message : String(e);
+          if (e instanceof AppleRateLimitError) {
+            summary.rateLimitHits += 1;
+            rateLimited = true;
+            // The limiter has armed its backoff; the next acquire() waits it out. Don't count against retries.
+            attempts -= 1;
+            if (summary.rateLimitHits > 20 && appleLimiter.status().consecutiveRateLimits >= 6) {
+              break; // ~10 min of straight 403s: give up on this term rather than hang forever.
+            }
+          }
+        }
+      }
+      if (item) summary.ok += 1;
+      else {
+        summary.failed += 1;
+        item = { term, country, appId, attempts, error: lastError || "unknown error", rateLimited };
+      }
+      results.push(item);
+      done += 1;
+      await opts.onResult?.(item, done, summary.total);
+    }
+  }
+  summary.durationMs = Date.now() - started;
+  return { results, summary };
 }
 
 /** Storefront ids for the hints endpoint (X-Apple-Store-Front header). */

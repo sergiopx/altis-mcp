@@ -2,6 +2,13 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { withStore, json, fail } from "../util.js";
+import { MetricsCache } from "../metrics.js";
+import type { Keyword } from "../db.js";
+
+function attachMetrics(keywords: Keyword[]): Array<Keyword & { metrics: ReturnType<MetricsCache["forKeyword"]> | null }> {
+  const cache = new MetricsCache();
+  return keywords.map((k) => ({ ...k, metrics: k.text ? cache.forKeyword(k.text, k.countryCode ?? "US") : null }));
+}
 
 export function registerAltisTools(server: McpServer): void {
 server.registerTool(
@@ -14,7 +21,7 @@ server.registerTool(
   },
   async () => {
     try {
-      return withStore((s) => json({ storePath: s.path, apps: s.listApps().length, agents: s.listAgents().length, ...s.stats() }));
+      return withStore((s) => json({ storePath: s.path, wal: s.wal, metricsCaches: new MetricsCache().available(), apps: s.listApps().length, agents: s.listAgents().length, ...s.stats() }));
     } catch (e) {
       return fail(e);
     }
@@ -63,7 +70,8 @@ server.registerTool(
   {
     title: "List keywords",
     description:
-      "Query keywords tracked or discovered in Altis. Each keyword carries popularity (0-100), difficulty (0-100), ASO/Ads opportunity scores, ads pollution, the app's last search position, and low-fruit flags. Filter and sort to answer questions like 'which keywords rank top 10' or 'best low-difficulty opportunities'.",
+      "Query keywords tracked or discovered in Altis. Each keyword carries popularity (0-100), difficulty (0-100), ASO/Ads opportunity scores, ads pollution, the app's last search position, and low-fruit flags. Filter and sort to answer questions like 'which keywords rank top 10' or 'best low-difficulty opportunities'. " +
+      "includeMetrics: true merges Altis's analysis caches: intent (Discovery / Keyword Intent / Needs), opportunity (realOpportunityScore, difficultyScore, ...), advanced metrics, and top10 { maxReviews, sumReviews, avgRating, newestAgeDays, medianAgeDays, dominantGenre, apps }.",
     inputSchema: {
       appId: z.number().int().optional().describe("Restrict to one tracked app"),
       countryCode: z.string().length(2).optional().describe("ISO country code, e.g. US"),
@@ -80,11 +88,15 @@ server.registerTool(
       limit: z.number().int().min(1).max(1000).optional().default(100),
       offset: z.number().int().min(0).optional().default(0),
       includeHistory: z.boolean().optional().default(false).describe("Include position history samples"),
+      includeMetrics: z.boolean().optional().default(false).describe("Attach intent, opportunity and Top 10 metrics from Altis's caches"),
     },
   },
-  async ({ includeHistory, ...filter }) => {
+  async ({ includeHistory, includeMetrics, ...filter }) => {
     try {
-      return withStore((s) => json(s.listKeywords(filter, includeHistory)));
+      return withStore((s) => {
+        const r = s.listKeywords(filter, includeHistory);
+        return json(includeMetrics ? { total: r.total, keywords: attachMetrics(r.keywords) } : r);
+      });
     } catch (e) {
       return fail(e);
     }
@@ -95,24 +107,26 @@ server.registerTool(
   "altis_get_keyword",
   {
     title: "Get keyword",
-    description: "Fetch one keyword with its full position history. Look up by Altis keyword id, or by text plus optional country/app.",
+    description: "Fetch one keyword with its full position history. Look up by Altis keyword id, or by text plus optional country/app. includeMetrics adds intent, opportunity and Top 10 metrics.",
     inputSchema: {
       id: z.number().int().optional(),
       text: z.string().optional(),
       countryCode: z.string().length(2).optional(),
       appId: z.number().int().optional(),
+      includeMetrics: z.boolean().optional().default(false),
     },
   },
-  async ({ id, text, countryCode, appId }) => {
+  async ({ id, text, countryCode, appId, includeMetrics }) => {
     try {
       return withStore((s) => {
+        const wrap = (ks: Keyword[]) => (includeMetrics ? attachMetrics(ks) : ks);
         if (id !== undefined) {
           const k = s.getKeyword(id);
-          return k ? json(k) : fail(`No keyword with id ${id}`);
+          return k ? json(wrap([k])[0]) : fail(`No keyword with id ${id}`);
         }
         if (!text) return fail("Provide either id or text");
         const ks = s.findKeyword(text, countryCode, appId);
-        return ks.length ? json(ks) : fail(`No keyword '${text}' found`);
+        return ks.length ? json(wrap(ks)) : fail(`No keyword '${text}' found`);
       });
     } catch (e) {
       return fail(e);
