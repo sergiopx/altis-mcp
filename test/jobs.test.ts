@@ -196,3 +196,36 @@ test("sustained search rate limiting aborts the whole screen job, including expa
     cleanup();
   }
 });
+
+test("expansion retries rate limits and skips broken queries instead of dying", async () => {
+  const cleanup = useTempStore();
+  const origFetch = globalThis.fetch;
+  let hintCalls = 0;
+  globalThis.fetch = (async (url: string | URL) => {
+    const u = new URL(String(url));
+    const term = u.searchParams.get("term")!;
+    if (u.hostname === "search.itunes.apple.com") {
+      hintCalls++;
+      if (hintCalls === 1) return new Response("", { status: 403, headers: { "retry-after": "0" } });
+      if (term === "bad c") return new Response("oops", { status: 500 });
+      return new Response(`<plist>${hintsXml([`${term.split(" ")[0]} calculator`])}</plist>`, { status: 200 });
+    }
+    return new Response(JSON.stringify({ resultCount: 1, results: [app(42)] }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const job = startJob({
+      kind: "screen", seeds: ["good", "bad"], appId: "42", countries: ["US"], suffixes: ["", "c"], modifiers: [], exclude: [], tracked: [],
+      maxCandidates: 100, rescreenAfterDays: 0, depth: 50, expandOnly: false,
+    });
+    await job.done;
+    assert.equal(job.status, "done");
+    assert.equal(job.state.seedsExpanded, 2);
+    assert.equal(job.state.queriesDone, 4);
+    assert.equal(job.state.expansionRateLimits, 1);
+    assert.equal(job.state.queryErrors, 1);
+    assert.ok(job.state.checksDone >= 3);
+  } finally {
+    globalThis.fetch = origFetch;
+    cleanup();
+  }
+});

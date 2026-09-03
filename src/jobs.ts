@@ -24,7 +24,8 @@ import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { checkOneWithRetry, normalizeTerm, summarizeTop10, type BatchItemResult, type RetryState } from "./apple.js";
+import { MAX_CONSECUTIVE_RATE_LIMITS, checkOneWithRetry, normalizeTerm, summarizeTop10, type BatchItemResult, type RetryState } from "./apple.js";
+import { AppleRateLimitError } from "./ratelimit.js";
 import { rateStatus, searchLimiter, suggestLimiter } from "./ratelimit.js";
 import { ScreenStore, type JobRecord, type JobStatus } from "./screenstore.js";
 import { suggestionsWithFlags } from "./suggest.js";
@@ -82,6 +83,10 @@ export interface JobState {
   suggestionCalls: number;
   suggestionCacheHits: number;
   serpCalls: number;
+  /** Autocomplete/SERP queries that failed for a non-throttling reason and were skipped. */
+  queryErrors: number;
+  /** Rate-limit responses seen during expansion (retried after backoff). */
+  expansionRateLimits: number;
   rawSuggestions: number;
   candidatesFound: number;
   candidatesSkipped: number;
@@ -105,7 +110,7 @@ function newState(): JobState {
   return {
     phase: "expanding",
     seedsTotal: 0, seedsExpanded: 0, queriesTotal: 0, queriesDone: 0,
-    suggestionCalls: 0, suggestionCacheHits: 0, serpCalls: 0, rawSuggestions: 0,
+    suggestionCalls: 0, suggestionCacheHits: 0, serpCalls: 0, queryErrors: 0, expansionRateLimits: 0, rawSuggestions: 0,
     candidatesFound: 0, candidatesSkipped: 0, candidatesTruncated: 0,
     dropped: { appNames: 0, excluded: 0, tracked: 0, tooShort: 0 },
     checksTotal: 0, checksDone: 0, checksOk: 0, checksFailed: 0,
@@ -172,6 +177,8 @@ export class Job {
   private readonly startedMs = Date.now();
   private checkDurations: number[] = [];
   private lastPersist = 0;
+  /** Heartbeat so a worker sleeping through a long backoff still looks alive to other processes. */
+  private heartbeat: NodeJS.Timeout | null = null;
   readonly done: Promise<void>;
 
   constructor(readonly input: JobInput, opts: { id?: string; store?: ScreenStore; createdAt?: string } = {}) {
@@ -181,7 +188,10 @@ export class Job {
     const store = opts.store;
     this.store = store ?? new ScreenStore();
     this.persist(true);
+    this.heartbeat = setInterval(() => this.persist(true), 30_000);
+    this.heartbeat.unref();
     this.done = this.run().finally(() => {
+      if (this.heartbeat) clearInterval(this.heartbeat);
       if (!store) this.store.close();
     });
   }
@@ -376,27 +386,58 @@ export class Job {
       if (!input.expandOnly) for (const c of input.countries) this.enqueue(queue, term, c, input.appId, maxAgeMs);
     };
 
+    /** One autocomplete query with the retry policy: rate limits wait out the backoff and retry; other errors skip the query. */
+    const expandQuery = async (q: string, seed: string, namesBySeed: Map<string, string[]>, streak: { n: number }) => {
+      for (;;) {
+        this.checkCancel();
+        try {
+          const res = await suggestionsWithFlags(this.store, q, primary, {
+            signal: this.abort.signal,
+            paceMs: input.suggestPaceMs,
+            serpPaceMs: input.searchPaceMs,
+            extraNames: namesBySeed.get(seed),
+            serpLookup: !namesBySeed.has(seed),
+          });
+          streak.n = 0;
+          return res;
+        } catch (e) {
+          if (this.abort.signal.aborted) throw e;
+          if (e instanceof AppleRateLimitError) {
+            s.expansionRateLimits += 1;
+            streak.n += 1;
+            if (streak.n >= MAX_CONSECUTIVE_RATE_LIMITS) {
+              this.finish("aborted", `Stopped after ${streak.n} consecutive rate-limit responses on the ${e.endpoint} endpoint during expansion; retry later`);
+              this.abort.abort(new CancelledError());
+              throw new CancelledError();
+            }
+            continue; // the limiter's backoff makes the next attempt wait
+          }
+          s.queryErrors += 1;
+          s.warning = `Skipped query '${q}': ${e instanceof Error ? e.message : String(e)}`;
+          return null;
+        }
+      }
+    };
+
     const expansion = (async () => {
       try {
         const namesBySeed = new Map<string, string[]>();
+        const streak = { n: 0 };
         for (const seed of seeds) {
           consider(seed, false); // seeds are queries by definition
           for (const suf of input.suffixes) {
-            this.checkCancel();
             const q = suf ? `${seed} ${suf}` : seed;
-            const res = await suggestionsWithFlags(this.store, q, primary, {
-              signal: this.abort.signal,
-              paceMs: input.suggestPaceMs,
-              serpPaceMs: input.searchPaceMs,
-              extraNames: namesBySeed.get(seed),
-              serpLookup: !namesBySeed.has(seed),
-            });
+            const res = await expandQuery(q, seed, namesBySeed, streak);
+            s.queriesDone += 1;
+            if (!res) {
+              this.persist();
+              continue;
+            }
             if (!namesBySeed.has(seed)) namesBySeed.set(seed, res.namesUsed);
             if (res.fromCache) s.suggestionCacheHits += 1;
             else s.suggestionCalls += 1;
             s.serpCalls += res.serpCalls;
             for (const sg of res.suggestions) consider(normalizeTerm(sg.term), sg.isAppName === true);
-            s.queriesDone += 1;
             this.persist();
           }
           for (const m of input.modifiers) consider(normalizeTerm(`${seed} ${m}`), false);
