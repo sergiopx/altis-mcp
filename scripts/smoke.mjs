@@ -1,0 +1,15 @@
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+const c = new Client({ name: 'smoke', version: '0' });
+await c.connect(new StdioClientTransport({ command: 'node', args: [new URL('../dist/index.js', import.meta.url).pathname] }));
+const tools = await c.listTools();
+console.log('TOOLS:', tools.tools.map(t => t.name).join(', '));
+const show = (name, r) => { const t = r.content[0].text; console.log(`\n== ${name}${r.isError ? ' (ERROR)' : ''}\n` + t.slice(0, 900)); };
+show('altis_status', await c.callTool({ name: 'altis_status', arguments: {} }));
+show('altis_list_apps', await c.callTool({ name: 'altis_list_apps', arguments: {} }));
+show('altis_list_keywords', await c.callTool({ name: 'altis_list_keywords', arguments: { appId: 2, rankedOnly: true, orderBy: 'lastPosition', limit: 3, includeHistory: true } }));
+show('altis_get_keyword', await c.callTool({ name: 'altis_get_keyword', arguments: { text: '1rm calculator', countryCode: 'US' } }));
+show('appstore_suggestions', await c.callTool({ name: 'appstore_suggestions', arguments: { term: 'plate calc' } }));
+show('appstore_check_rank', await c.callTool({ name: 'appstore_check_rank', arguments: { term: '1rm calculator', appId: '6768525538' } }));
+show('appstore_lookup', await c.callTool({ name: 'appstore_lookup', arguments: { id: '6768525538' } }));
+await c.close();
