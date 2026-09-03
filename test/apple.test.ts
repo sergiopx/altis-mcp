@@ -94,3 +94,27 @@ test("checkRankBatch retries rate limits, records errors, honours skip and onRes
     appleLimiter.reset();
   }
 });
+
+test("checkRankBatch aborts after sustained rate limiting and keeps completed results", async () => {
+  appleLimiter.reset();
+  appleLimiter.paceMs = 0;
+  const origFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = (async (url: string | URL) => {
+    calls++;
+    const term = new URL(String(url)).searchParams.get("term");
+    if (term === "first") return new Response(JSON.stringify({ resultCount: 1, results: [app(42)] }), { status: 200 });
+    return new Response("", { status: 403, headers: { "retry-after": "0" } });
+  }) as typeof fetch;
+  try {
+    const { results, summary } = await checkRankBatch(["first", "second", "third"], "42", { maxRetries: 3 });
+    assert.equal(summary.ok, 1);
+    assert.ok(summary.aborted, "batch reports the abort");
+    assert.equal(results.length, 2, "third term never attempted");
+    assert.equal(results[1].rateLimited, true);
+    assert.equal(calls, 1 + 6);
+  } finally {
+    globalThis.fetch = origFetch;
+    appleLimiter.reset();
+  }
+});

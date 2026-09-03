@@ -63,6 +63,8 @@ export function registerScreenTools(server: McpServer): void {
         const raw = new Map<string, { isAppName: boolean; fromSeed: string }>();
         let cacheHits = 0;
         let suggestionCalls = 0;
+        let serpCalls = 0;
+        // App titles learned per seed: at most one SERP lookup per seed, reused for every suffix query.
         const namesBySeed = new Map<string, string[]>();
         for (let i = 0; i < queries.length; i++) {
           const q = queries[i];
@@ -71,12 +73,12 @@ export function registerScreenTools(server: McpServer): void {
             signal: extra.signal,
             paceMs: input.paceMs,
             extraNames: namesBySeed.get(seed),
-            // Only fetch a SERP for name detection once per seed (its first query); reuse via extraNames.
-            detectAppNames: namesBySeed.has(seed) ? undefined : true,
+            serpLookup: !namesBySeed.has(seed),
           });
           if (res.fromCache) cacheHits += 1;
           else suggestionCalls += 1;
-          if (!namesBySeed.has(seed)) namesBySeed.set(seed, store.knownAppNames(primary));
+          serpCalls += res.serpCalls;
+          if (!namesBySeed.has(seed)) namesBySeed.set(seed, res.namesUsed);
           for (const s of res.suggestions) {
             const norm = normalizeTerm(s.term);
             if (!norm) continue;
@@ -120,6 +122,7 @@ export function registerScreenTools(server: McpServer): void {
           seeds,
           queries: queries.length,
           suggestionCalls,
+          serpCalls,
           cacheHits,
           rawSuggestions: raw.size,
           candidates: candidates.length,
@@ -150,7 +153,8 @@ export function registerScreenTools(server: McpServer): void {
         });
 
         // 5. Shortlist from the store (latest row per term carries the scoring inputs).
-        const rows = store.results({ appId: input.appId, limit: 5000 }).results.filter((r) => toCheck.includes(r.term) && countries.includes(r.country));
+        const checkedSet = new Set(toCheck);
+        const rows = store.results({ appId: input.appId, limit: 5000 }).results.filter((r) => checkedSet.has(r.term) && countries.includes(r.country));
         const ranked = rows.filter((r) => r.position !== null && r.position <= 100).sort((a, b) => a.position! - b.position!);
         const weakTop10 = rows
           .filter((r) => (r.avgRating !== null && r.avgRating < 4) || (r.maxReviews !== null && r.maxReviews < 50_000) || (r.medianAgeDays !== null && r.medianAgeDays < 180))
@@ -161,6 +165,7 @@ export function registerScreenTools(server: McpServer): void {
           countries,
           expansion,
           batch: summary,
+          ...(summary.aborted ? { warning: summary.aborted } : {}),
           rate: appleLimiter.status(),
           shortlist: { ranked, weakTop10 },
           errors,

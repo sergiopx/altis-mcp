@@ -8,16 +8,25 @@ import { DEFAULT_SUGGESTION_TTL_MS, ScreenStore, withScreenStore } from "../scre
 
 const PACING_NOTE = "All Apple calls share one process-wide limiter (~3 s apart, exponential backoff on 403/429); see rate_status.";
 
+export interface SuggestionOptions {
+  refresh?: boolean;
+  /** Attach isAppName to each suggestion (default true). */
+  detectAppNames?: boolean;
+  /** Allow one search call for the term's SERP to learn app titles (default true). Skipped when the suggestions came from cache and titles are already known. */
+  serpLookup?: boolean;
+  ttlMs?: number;
+  signal?: AbortSignal;
+  paceMs?: number;
+  /** Extra app titles to match against (e.g. learned from an earlier query of the same seed). */
+  extraNames?: Iterable<string>;
+}
+
 /**
- * Autocomplete with the on-disk cache and app-name flagging. One extra search
- * call (the seed's SERP) supplies app titles to match against; stored SERPs add more.
+ * Autocomplete with the on-disk cache and app-name flagging. App titles come
+ * from SERPs stored in the screening store, `extraNames`, and (when allowed)
+ * one search call for this term. Returns the titles used so callers can reuse them.
  */
-export async function suggestionsWithFlags(
-  store: ScreenStore,
-  term: string,
-  country: string,
-  opts: { refresh?: boolean; detectAppNames?: boolean; ttlMs?: number; signal?: AbortSignal; paceMs?: number; extraNames?: Iterable<string> } = {},
-) {
+export async function suggestionsWithFlags(store: ScreenStore, term: string, country: string, opts: SuggestionOptions = {}) {
   const ttl = opts.ttlMs ?? DEFAULT_SUGGESTION_TTL_MS;
   const cached = opts.refresh ? null : store.getSuggestions(term, country, ttl);
   let raw: string[];
@@ -32,20 +41,18 @@ export async function suggestionsWithFlags(
     store.saveSuggestions(term, country, raw);
     fetchedAt = new Date().toISOString();
   }
-  let names: string[] = [];
+  const names: string[] = [];
+  let serpCalls = 0;
   if (opts.detectAppNames !== false) {
-    names = [...store.knownAppNames(country), ...(opts.extraNames ?? [])];
-    if (!fromCache || !names.length) {
-      try {
-        const serp = await searchApps(term, country, 50, { signal: opts.signal, paceMs: opts.paceMs });
-        names.push(...serp.map((a) => a.trackName));
-      } catch (e) {
-        if (opts.detectAppNames === true) throw e; // caller insisted; surface the rate limit
-      }
+    names.push(...store.knownAppNames(country), ...(opts.extraNames ?? []));
+    if (opts.serpLookup !== false && (!fromCache || names.length === 0)) {
+      const serp = await searchApps(term, country, 50, { signal: opts.signal, paceMs: opts.paceMs });
+      serpCalls = 1;
+      names.push(...serp.map((a) => a.trackName));
     }
   }
   const suggestions = raw.map((s) => ({ term: s, isAppName: opts.detectAppNames === false ? undefined : looksLikeAppName(s, names) }));
-  return { term, country: country.toUpperCase(), fromCache, fetchedAt, suggestions };
+  return { term, country: country.toUpperCase(), fromCache, fetchedAt, serpCalls, suggestions, namesUsed: names };
 }
 
 export function registerAppStoreTools(server: McpServer): void {
@@ -118,7 +125,8 @@ export function registerAppStoreTools(server: McpServer): void {
     },
     async ({ term, country, refresh, detectAppNames }, extra) => {
       try {
-        return json(await withScreenStore((s) => suggestionsWithFlags(s, term, country, { refresh, detectAppNames, signal: extra.signal })));
+        const { namesUsed: _names, ...out } = await withScreenStore((s) => suggestionsWithFlags(s, term, country, { refresh, detectAppNames, signal: extra.signal }));
+        return json(out);
       } catch (e) {
         return failApple(e);
       }

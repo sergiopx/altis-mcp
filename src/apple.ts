@@ -310,7 +310,12 @@ export interface BatchSummary {
   skipped: number;
   rateLimitHits: number;
   durationMs: number;
+  /** Set when the batch stopped early (sustained rate limiting); unprocessed terms are omitted. */
+  aborted?: string;
 }
+
+/** Consecutive 403/429 responses (each waited out with backoff) before a batch gives up. */
+export const MAX_CONSECUTIVE_RATE_LIMITS = 6;
 
 /**
  * Sequential paced rank checks over terms × countries. Rate-limit responses
@@ -328,7 +333,7 @@ export async function checkRankBatch(
   const summary: BatchSummary = { total: terms.length * countries.length, ok: 0, failed: 0, skipped: 0, rateLimitHits: 0, durationMs: 0 };
   let done = 0;
 
-  for (const country of countries) {
+  outer: for (const country of countries) {
     for (const term of terms) {
       if (opts.signal?.aborted) throw opts.signal.reason instanceof Error ? opts.signal.reason : new Error("Batch aborted");
       const cached = opts.skip?.(term, country);
@@ -357,8 +362,10 @@ export async function checkRankBatch(
             rateLimited = true;
             // The limiter has armed its backoff; the next acquire() waits it out. Don't count against retries.
             attempts -= 1;
-            if (summary.rateLimitHits > 20 && appleLimiter.status().consecutiveRateLimits >= 6) {
-              break; // ~10 min of straight 403s: give up on this term rather than hang forever.
+            if (appleLimiter.status().consecutiveRateLimits >= MAX_CONSECUTIVE_RATE_LIMITS) {
+              // Roughly half an hour of straight 403s: stop the whole batch. Completed terms are already persisted.
+              summary.aborted = `Stopped after ${appleLimiter.status().consecutiveRateLimits} consecutive rate-limit responses; retry later (see rate_status)`;
+              break;
             }
           }
         }
@@ -371,6 +378,7 @@ export async function checkRankBatch(
       results.push(item);
       done += 1;
       await opts.onResult?.(item, done, summary.total);
+      if (summary.aborted) break outer;
     }
   }
   summary.durationMs = Date.now() - started;
