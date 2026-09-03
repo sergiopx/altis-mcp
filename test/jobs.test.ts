@@ -165,3 +165,34 @@ test("a running job from a dead process is reported as aborted once stale", () =
     cleanup();
   }
 });
+
+test("sustained search rate limiting aborts the whole screen job, including expansion", async () => {
+  const cleanup = useTempStore();
+  const origFetch = globalThis.fetch;
+  let hints = 0;
+  globalThis.fetch = (async (url: string | URL) => {
+    const u = new URL(String(url));
+    if (u.hostname === "search.itunes.apple.com") {
+      hints++;
+      await new Promise((r) => setTimeout(r, 5));
+      const seed = u.searchParams.get("term")!.split(" ")[0];
+      return new Response(`<plist>${hintsXml([`${seed} calculator`, `${seed} tracker`])}</plist>`, { status: 200 });
+    }
+    return new Response("", { status: 403, headers: { "retry-after": "0" } });
+  }) as typeof fetch;
+  try {
+    const job = startJob({
+      kind: "screen", seeds: Array.from({ length: 40 }, (_, i) => `seed${i}`), appId: "42", countries: ["US"], suffixes: ["", "c"], modifiers: [], exclude: [], tracked: [],
+      maxCandidates: 1000, rescreenAfterDays: 0, depth: 50, expandOnly: false,
+    });
+    await job.done;
+    assert.equal(job.status, "aborted");
+    assert.ok(job.state.seedsExpanded < 40, `expansion stopped early (${job.state.seedsExpanded})`);
+    const store = new ScreenStore();
+    assert.equal(store.jobCandidateCounts(job.id).pending ?? 0, 0, "no pending rows left behind");
+    store.close();
+  } finally {
+    globalThis.fetch = origFetch;
+    cleanup();
+  }
+});

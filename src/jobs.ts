@@ -259,6 +259,7 @@ export class Job {
       else await this.runScreen(this.input);
       if (this.status === "running") this.finish("done");
     } catch (e) {
+      if (this.status !== "running") return; // already finished (e.g. aborted by the rank worker)
       if (e instanceof CancelledError || this.abort.signal.aborted) this.finish("cancelled", "Cancelled");
       else this.finish("failed", e instanceof Error ? e.message : String(e));
     }
@@ -304,6 +305,7 @@ export class Job {
       this.noteResult(item, false, source);
       if (aborted) {
         this.finish("aborted", `Stopped after ${retry.consecutiveRateLimits} consecutive rate-limit responses on the search endpoint; retry later`);
+        this.abort.abort(new CancelledError()); // stop the expansion worker too, so the process exits
         return;
       }
     }

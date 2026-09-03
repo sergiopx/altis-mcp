@@ -97,6 +97,7 @@ export class ScreenStore {
     this.db = new DatabaseSync(path);
     this.db.exec(`
       PRAGMA journal_mode = WAL;
+      PRAGMA busy_timeout = 5000;
       CREATE TABLE IF NOT EXISTS rank_checks (
         id INTEGER PRIMARY KEY,
         term TEXT NOT NULL,
