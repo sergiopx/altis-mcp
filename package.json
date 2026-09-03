@@ -3,15 +3,24 @@
   "version": "0.1.0",
   "description": "MCP server for Altis ASO (tryaltis.com): reads the local Altis macOS app database and queries the App Store for live keyword data.",
   "type": "module",
-  "bin": { "altis-mcp": "dist/index.js" },
-  "files": ["dist"],
-  "engines": { "node": ">=22.13" },
+  "bin": {
+    "altis-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "node src/index.ts",
     "start": "node dist/index.js",
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "pnpm build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.0",
@@ -20,5 +29,28 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.8.0"
+  },
+  "license": "MIT",
+  "author": "Sergio Ponce",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sergiopx/altis-mcp.git"
+  },
+  "homepage": "https://github.com/sergiopx/altis-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/sergiopx/altis-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "altis",
+    "aso",
+    "app-store",
+    "app-store-optimization",
+    "keywords",
+    "claude"
+  ],
+  "publishConfig": {
+    "access": "public"
   }
 }

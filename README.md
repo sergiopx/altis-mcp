@@ -14,15 +14,12 @@ same public Apple endpoints Altis uses. Nothing is written to Altis.
 
 ## Install
 
-```sh
-pnpm install
-pnpm build
-```
+No install step needed; run it with `npx`.
 
 ### Claude Code
 
 ```sh
-claude mcp add altis -s user -- node /Users/sp/code/altis-mcp/dist/index.js
+claude mcp add altis -s user -- npx -y altis-mcp
 ```
 
 ### Claude Desktop / other clients
@@ -30,9 +27,17 @@ claude mcp add altis -s user -- node /Users/sp/code/altis-mcp/dist/index.js
 ```json
 {
   "mcpServers": {
-    "altis": { "command": "node", "args": ["/Users/sp/code/altis-mcp/dist/index.js"] }
+    "altis": { "command": "npx", "args": ["-y", "altis-mcp"] }
   }
 }
+```
+
+### From source
+
+```sh
+git clone https://github.com/sergiopx/altis-mcp && cd altis-mcp
+pnpm install && pnpm build
+claude mcp add altis -s user -- node "$PWD/dist/index.js"
 ```
 
 Set `ALTIS_STORE_PATH` to point at a different `default.store` if needed.
