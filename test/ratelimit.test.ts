@@ -64,3 +64,15 @@ test("acquire respects abort", async () => {
   await l.acquire("search");
   await assert.rejects(l.acquire("search", { signal: ac.signal }));
 });
+
+test("limiters are independent: a 403 on search does not slow autocomplete", async () => {
+  const { searchLimiter, suggestLimiter, rateStatus } = await import("../dist/ratelimit.js");
+  searchLimiter.reset();
+  suggestLimiter.reset();
+  searchLimiter.recordRateLimit("search", 403, null);
+  const st = rateStatus();
+  assert.equal(st.search.currentBackoffSeconds, 60);
+  assert.equal(st.autocomplete.currentBackoffSeconds, 0);
+  assert.equal(st.autocomplete.nextSafeCallInSeconds, 0);
+  searchLimiter.reset();
+});

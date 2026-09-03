@@ -22,7 +22,7 @@ import { registerScreenTools } from "./tools/screen.js";
 import { registerMetadataTools } from "./tools/metadata.js";
 import { screenStorePath } from "./screenstore.js";
 
-const server = new McpServer({ name: "altis-mcp", version: "0.1.0" });
+const server = new McpServer({ name: "altis-mcp", version: "0.2.0" });
 
 registerAltisTools(server);
 registerAppStoreTools(server);
@@ -48,3 +48,4 @@ server.registerResource(
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+

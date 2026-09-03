@@ -49,7 +49,8 @@ Environment variables:
 | `ALTIS_STORE_PATH` | Altis container `default.store` | Altis SQLite store to read |
 | `ALTIS_METRICS_DIR` | `AltisASO/` beside the store | Altis JSON caches (metrics, competitors, intent, opportunity) |
 | `ALTIS_MCP_DATA_DIR` | `~/Library/Application Support/altis-mcp` | Server-owned screening store and autocomplete cache |
-| `ALTIS_MCP_PACE_MS` | `3000` | Minimum spacing between Apple calls |
+| `ALTIS_MCP_PACE_SEARCH_MS` | `1200` | Minimum spacing between search/lookup calls (rank checks, SERPs) |
+| `ALTIS_MCP_PACE_SUGGEST_MS` | `600` | Minimum spacing between autocomplete calls |
 
 ## Tools
 
@@ -73,7 +74,7 @@ Altis writes (UI automation; Altis must be running and frontmost):
 | `altis_add_keywords` | Type keywords into the Add field and verify the store count. Guards: dedupe, 30-slot free-plan limit, no open dialog |
 | `altis_delete_keywords` | Delete one keyword at a time via the "Delete Selected" button, verifying the count drops by exactly 1 each time |
 
-Live App Store (Apple public endpoints, paced ~3 s apart with backoff on 403/429):
+Live App Store (Apple public endpoints; search and autocomplete each have their own limiter with backoff on 403/429):
 
 | Tool | What it does |
 |---|---|
@@ -81,15 +82,18 @@ Live App Store (Apple public endpoints, paced ~3 s apart with backoff on 403/429
 | `appstore_lookup` | App listing by Apple ID or bundle id |
 | `appstore_suggestions` | Autocomplete suggestions, cached 7 days on disk, each flagged `isAppName` when it looks like an app title |
 | `appstore_check_rank` | Where an app ranks for a term right now, the top 10 with release dates and genre, and a `top10` summary |
-| `appstore_check_rank_batch` | Paced rank checks for many terms and countries in one call; every result persisted as it completes; MCP progress notifications |
-| `rate_status` | Calls per minute, last 403/429, current backoff, seconds until the next safe call |
+| `appstore_check_rank_batch` | Paced rank checks for many terms and countries; every result persisted as it completes; `async: true` returns a job id |
+| `rate_status` | Per-endpoint calls per minute, last 403/429, current backoff, seconds until the next safe call |
 
 Screening pipeline (server-owned SQLite store):
 
 | Tool | What it does |
 |---|---|
-| `screen` | Seeds → cached autocomplete expansion (letter suffixes, modifiers) → dedupe → drop app titles, tracked and excluded terms → paced batch rank check → shortlist |
-| `screen_results` | Latest stored check per term with scoring inputs: position, maxReviews, sumReviews, avgRating, newestAgeDays, medianAgeDays, dominantGenre |
+| `screen` | Background job: seeds → cached autocomplete expansion (letter suffixes, modifiers) → dedupe → drop app titles, tracked and excluded terms → rank checks that start as soon as candidates exist. Returns a job id (`async: false` blocks) |
+| `screen_job_status` | Phase, seeds expanded, candidates found, checks done/total, rate limits, backoff, ETA, last 10 checks. Works across server processes and restarts |
+| `screen_job_cancel` | Stop a job after its current Apple call |
+| `screen_jobs` | Recent jobs with status and progress |
+| `screen_results` | Latest stored check per term with scoring inputs: position, maxReviews, sumReviews, avgRating, newestAgeDays, medianAgeDays, dominantGenre; plus pending-term counts of running jobs |
 | `screen_history` | Position series for one term |
 | `screen_store_status` | Store location and counts |
 
@@ -114,8 +118,12 @@ Altis's keyword analysis (Top 10 competitors, intent, opportunity, advanced
 metrics) lives in JSON caches under `AltisASO/` beside the store, keyed by
 `"<keyword>:<COUNTRY>"`. `includeMetrics` merges them.
 
-The server's own data (rank checks, suggestion cache) lives in
-`~/Library/Application Support/altis-mcp/screen.sqlite`.
+The server's own data (rank checks, suggestion cache, jobs) lives in
+`~/Library/Application Support/altis-mcp/screen.sqlite`. Jobs run inside the
+server process and keep running after the client that started them
+disconnects; their state is written to the store on every step, so any later
+client (or a restarted server) can read status and results. A job whose
+heartbeat stops for 15 minutes is reported as aborted.
 
 ## Development
 

@@ -1,16 +1,20 @@
 /**
  * Shared pacing and backoff for every Apple call the server makes.
  *
- * Apple throttles per client (~20 calls/min across storefronts) and answers
- * with HTTP 403 (sometimes 429). One process-wide limiter serialises calls,
- * enforces a minimum interval between them, honours Retry-After, and applies
- * exponential backoff (60 s, 120 s, ... capped) when Apple gives no hint.
+ * Apple throttles per client and answers with HTTP 403 (sometimes 429). The
+ * search endpoint (itunes.apple.com/search, also used for lookups) and the
+ * autocomplete endpoint (search hints) are throttled independently, so each
+ * gets its own limiter: it serialises calls, enforces a minimum interval,
+ * honours Retry-After, and applies exponential backoff (60 s, 120 s, ...
+ * capped) when Apple gives no hint. A 403 on one endpoint never slows the other.
  *
  * `now` and `sleep` are injectable so tests can drive the limiter without
  * wall-clock waits.
  */
 
 export const DEFAULT_PACE_MS = 3000;
+export const DEFAULT_SEARCH_PACE_MS = 1200;
+export const DEFAULT_SUGGEST_PACE_MS = 600;
 export const DEFAULT_INITIAL_BACKOFF_MS = 60_000;
 export const DEFAULT_MAX_BACKOFF_MS = 600_000;
 
@@ -213,11 +217,22 @@ export class AppleRateLimiter {
   }
 }
 
-function paceFromEnv(): number {
-  const raw = process.env.ALTIS_MCP_PACE_MS;
-  const n = raw ? Number(raw) : NaN;
-  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_PACE_MS;
+function paceFromEnv(names: string[], fallback: number): number {
+  for (const name of names) {
+    const raw = process.env[name];
+    const n = raw ? Number(raw) : NaN;
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return fallback;
 }
 
-/** The single limiter shared by every Apple-calling function in the process. */
-export const appleLimiter = new AppleRateLimiter({ paceMs: paceFromEnv() });
+/** Limiter for itunes.apple.com/search and /lookup (rank checks, SERPs). Env: ALTIS_MCP_PACE_SEARCH_MS (or legacy ALTIS_MCP_PACE_MS). */
+export const searchLimiter = new AppleRateLimiter({ paceMs: paceFromEnv(["ALTIS_MCP_PACE_SEARCH_MS", "ALTIS_MCP_PACE_MS"], DEFAULT_SEARCH_PACE_MS) });
+
+/** Limiter for the autocomplete (search hints) endpoint. Env: ALTIS_MCP_PACE_SUGGEST_MS. */
+export const suggestLimiter = new AppleRateLimiter({ paceMs: paceFromEnv(["ALTIS_MCP_PACE_SUGGEST_MS"], DEFAULT_SUGGEST_PACE_MS) });
+
+/** Status of both limiters, as reported by rate_status. */
+export function rateStatus() {
+  return { search: searchLimiter.status(), autocomplete: suggestLimiter.status() };
+}

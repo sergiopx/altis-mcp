@@ -1,9 +1,10 @@
 /**
  * Apple public App Store endpoints (no auth): search, lookup, autocomplete
- * hints and rank checks built on top of them. Every request goes through the
- * shared rate limiter so pacing and backoff hold across all tools.
+ * hints and rank checks built on top of them. Search/lookup requests go through
+ * the search limiter and autocomplete through its own, so pacing and backoff
+ * hold across all tools without one endpoint's 403 slowing the other.
  */
-import { AppleRateLimitError, appleLimiter } from "./ratelimit.js";
+import { AppleRateLimitError, AppleRateLimiter, searchLimiter, suggestLimiter } from "./ratelimit.js";
 
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
 
@@ -35,21 +36,21 @@ export interface FetchOptions {
   paceMs?: number;
 }
 
-/** Fetch through the limiter; 403/429 become AppleRateLimitError and arm the backoff. */
-async function limitedFetch(endpoint: string, url: string, init: RequestInit, opts: FetchOptions = {}): Promise<Response> {
-  await appleLimiter.acquire(endpoint, { signal: opts.signal, paceMs: opts.paceMs });
+/** Fetch through a limiter; 403/429 become AppleRateLimitError and arm that limiter's backoff. */
+async function limitedFetch(limiter: AppleRateLimiter, endpoint: string, url: string, init: RequestInit, opts: FetchOptions = {}): Promise<Response> {
+  await limiter.acquire(endpoint, { signal: opts.signal, paceMs: opts.paceMs });
   const res = await fetch(url, { ...init, signal: opts.signal });
   if (res.status === 403 || res.status === 429) {
-    const wait = appleLimiter.recordRateLimit(endpoint, res.status, res.headers.get("retry-after"));
+    const wait = limiter.recordRateLimit(endpoint, res.status, res.headers.get("retry-after"));
     throw new AppleRateLimitError(endpoint, res.status, wait, url);
   }
   if (!res.ok) throw new Error(`Apple API ${res.status} for ${url}`);
-  appleLimiter.recordSuccess(endpoint);
+  limiter.recordSuccess(endpoint);
   return res;
 }
 
 async function fetchJson<T>(endpoint: string, url: string, opts?: FetchOptions): Promise<T> {
-  const res = await limitedFetch(endpoint, url, { headers: { "User-Agent": UA, Accept: "application/json" } }, opts);
+  const res = await limitedFetch(searchLimiter, endpoint, url, { headers: { "User-Agent": UA, Accept: "application/json" } }, opts);
   return (await res.json()) as T;
 }
 
@@ -101,6 +102,7 @@ export async function searchHints(term: string, country = "us", opts?: FetchOpti
   url.searchParams.set("term", term);
   const storefront = STOREFRONTS[country.toUpperCase()] ?? STOREFRONTS.US;
   const res = await limitedFetch(
+    suggestLimiter,
     "hints",
     url.toString(),
     { headers: { "User-Agent": UA, "X-Apple-Store-Front": `${storefront}-1,29` } },
@@ -317,6 +319,59 @@ export interface BatchSummary {
 /** Consecutive 403/429 responses (each waited out with backoff) before a batch gives up. */
 export const MAX_CONSECUTIVE_RATE_LIMITS = 6;
 
+export interface RetryState {
+  /** Consecutive rate-limit responses seen by this caller (reset on success). */
+  consecutiveRateLimits: number;
+  rateLimitHits: number;
+}
+
+export interface CheckOneOptions {
+  depth?: number;
+  paceMs?: number;
+  maxRetries?: number;
+  signal?: AbortSignal;
+}
+
+/**
+ * One rank check with the batch retry policy: rate-limit responses wait out
+ * the limiter's backoff and retry without counting against maxRetries; other
+ * errors retry up to maxRetries. Returns `aborted: true` when the caller's
+ * consecutive rate-limit streak reaches MAX_CONSECUTIVE_RATE_LIMITS.
+ */
+export async function checkOneWithRetry(
+  term: string,
+  appId: string,
+  country: string,
+  state: RetryState,
+  opts: CheckOneOptions = {},
+): Promise<{ item: BatchItemResult; aborted: boolean }> {
+  const maxRetries = opts.maxRetries ?? 5;
+  let attempts = 0;
+  let lastError = "";
+  let rateLimited = false;
+  while (attempts < maxRetries) {
+    attempts += 1;
+    try {
+      const r = await checkRank(term, appId, country, opts.depth ?? 200, { signal: opts.signal, paceMs: opts.paceMs });
+      state.consecutiveRateLimits = 0;
+      return { item: { ...r, attempts }, aborted: false };
+    } catch (e) {
+      if (opts.signal?.aborted) throw e;
+      lastError = e instanceof Error ? e.message : String(e);
+      if (e instanceof AppleRateLimitError) {
+        state.rateLimitHits += 1;
+        state.consecutiveRateLimits += 1;
+        rateLimited = true;
+        attempts -= 1; // the limiter has armed its backoff; the next acquire() waits it out
+        if (state.consecutiveRateLimits >= MAX_CONSECUTIVE_RATE_LIMITS) {
+          return { item: { term, country: country.toUpperCase(), appId, attempts, error: lastError, rateLimited }, aborted: true };
+        }
+      }
+    }
+  }
+  return { item: { term, country: country.toUpperCase(), appId, attempts, error: lastError || "unknown error", rateLimited }, aborted: false };
+}
+
 /**
  * Sequential paced rank checks over terms × countries. Rate-limit responses
  * wait out the limiter's backoff and retry; other errors retry up to maxRetries.
@@ -327,13 +382,11 @@ export async function checkRankBatch(
   opts: BatchOptions = {},
 ): Promise<{ results: BatchItemResult[]; summary: BatchSummary }> {
   const countries = (opts.countries?.length ? opts.countries : ["us"]).map((c) => c.toUpperCase());
-  const maxRetries = opts.maxRetries ?? 5;
   const started = Date.now();
   const results: BatchItemResult[] = [];
   const summary: BatchSummary = { total: terms.length * countries.length, ok: 0, failed: 0, skipped: 0, rateLimitHits: 0, durationMs: 0 };
+  const state: RetryState = { consecutiveRateLimits: 0, rateLimitHits: 0 };
   let done = 0;
-  // Tracked per batch: the shared limiter's counter resets on any successful call in the process.
-  let consecutiveRateLimits = 0;
 
   outer: for (const country of countries) {
     for (const term of terms) {
@@ -346,38 +399,13 @@ export async function checkRankBatch(
         await opts.onResult?.(cached, done, summary.total);
         continue;
       }
-      let item: BatchItemResult | null = null;
-      let attempts = 0;
-      let lastError = "";
-      let rateLimited = false;
-      while (attempts < maxRetries) {
-        attempts += 1;
-        try {
-          const r = await checkRank(term, appId, country, opts.depth ?? 200, { signal: opts.signal, paceMs: opts.paceMs });
-          item = { ...r, attempts };
-          consecutiveRateLimits = 0;
-          break;
-        } catch (e) {
-          if (opts.signal?.aborted) throw e;
-          lastError = e instanceof Error ? e.message : String(e);
-          if (e instanceof AppleRateLimitError) {
-            summary.rateLimitHits += 1;
-            consecutiveRateLimits += 1;
-            rateLimited = true;
-            // The limiter has armed its backoff; the next acquire() waits it out. Don't count against retries.
-            attempts -= 1;
-            if (consecutiveRateLimits >= MAX_CONSECUTIVE_RATE_LIMITS) {
-              // Roughly half an hour of straight 403s: stop the whole batch. Completed terms are already persisted.
-              summary.aborted = `Stopped after ${consecutiveRateLimits} consecutive rate-limit responses; retry later (see rate_status)`;
-              break;
-            }
-          }
-        }
-      }
-      if (item) summary.ok += 1;
-      else {
-        summary.failed += 1;
-        item = { term, country, appId, attempts, error: lastError || "unknown error", rateLimited };
+      const { item, aborted } = await checkOneWithRetry(term, appId, country, state, opts);
+      summary.rateLimitHits = state.rateLimitHits;
+      if (item.error) summary.failed += 1;
+      else summary.ok += 1;
+      if (aborted) {
+        // Roughly half an hour of straight 403s: stop the whole batch. Completed terms are already persisted.
+        summary.aborted = `Stopped after ${state.consecutiveRateLimits} consecutive rate-limit responses; retry later (see rate_status)`;
       }
       results.push(item);
       done += 1;

@@ -73,6 +73,20 @@ export interface ScreenResultsFilter {
 
 type Row = Record<string, unknown>;
 
+export type JobStatus = "running" | "done" | "aborted" | "cancelled" | "failed";
+
+export interface JobRecord {
+  id: string;
+  kind: "screen" | "batch";
+  status: JobStatus;
+  pid: number | null;
+  createdAt: string;
+  updatedAt: string;
+  finishedAt: string | null;
+  input: unknown;
+  state: unknown;
+}
+
 export class ScreenStore {
   private db: DatabaseSync;
   readonly path: string;
@@ -105,6 +119,29 @@ export class ScreenStore {
         suggestions TEXT NOT NULL,
         PRIMARY KEY (term, country)
       );
+      CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        pid INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT,
+        cancel_requested INTEGER NOT NULL DEFAULT 0,
+        input TEXT NOT NULL,
+        state TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS job_candidates (
+        job_id TEXT NOT NULL,
+        term TEXT NOT NULL,
+        country TEXT NOT NULL,
+        status TEXT NOT NULL,
+        position INTEGER,
+        error TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (job_id, term, country)
+      );
+      CREATE INDEX IF NOT EXISTS job_candidates_status ON job_candidates(job_id, status);
     `);
   }
 
@@ -253,6 +290,82 @@ export class ScreenStore {
     return rows.map((r) => r.name as string);
   }
 
+  // ------------------------------------------------------------ jobs
+
+  saveJob(j: JobRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO jobs (id, kind, status, pid, created_at, updated_at, finished_at, cancel_requested, input, state)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET status = excluded.status, pid = excluded.pid, updated_at = excluded.updated_at,
+           finished_at = excluded.finished_at, state = excluded.state`,
+      )
+      .run(j.id, j.kind, j.status, j.pid, j.createdAt, j.updatedAt, j.finishedAt, 0, JSON.stringify(j.input), JSON.stringify(j.state));
+  }
+
+  getJob(id: string): (JobRecord & { cancelRequested: boolean }) | null {
+    const r = this.db.prepare("SELECT * FROM jobs WHERE id = ?").get(id) as Row | undefined;
+    return r ? mapJob(r) : null;
+  }
+
+  listJobs(status?: string, limit = 50): Array<JobRecord & { cancelRequested: boolean }> {
+    const rows = status
+      ? (this.db.prepare("SELECT * FROM jobs WHERE status = ? ORDER BY created_at DESC LIMIT ?").all(status, limit) as Row[])
+      : (this.db.prepare("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?").all(limit) as Row[]);
+    return rows.map(mapJob);
+  }
+
+  requestJobCancel(id: string): boolean {
+    return this.db.prepare("UPDATE jobs SET cancel_requested = 1 WHERE id = ?").run(id).changes > 0;
+  }
+
+  jobCancelRequested(id: string): boolean {
+    const r = this.db.prepare("SELECT cancel_requested AS c FROM jobs WHERE id = ?").get(id) as Row | undefined;
+    return r?.c === 1;
+  }
+
+  addJobCandidate(jobId: string, term: string, country: string, status: "pending" | "skipped"): boolean {
+    return (
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO job_candidates (job_id, term, country, status, updated_at) VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(jobId, term.toLowerCase(), country.toUpperCase(), status, new Date().toISOString()).changes > 0
+    );
+  }
+
+  updateJobCandidate(jobId: string, term: string, country: string, status: "done" | "error" | "cancelled", position: number | null, error?: string): void {
+    this.db
+      .prepare(`UPDATE job_candidates SET status = ?, position = ?, error = ?, updated_at = ? WHERE job_id = ? AND term = ? AND country = ?`)
+      .run(status, position, error ?? null, new Date().toISOString(), jobId, term.toLowerCase(), country.toUpperCase());
+  }
+
+  /** Mark every still-pending candidate of a job (e.g. after a cancel or abort). */
+  finishPendingCandidates(jobId: string, status: "cancelled" | "error", error: string): number {
+    return Number(
+      this.db
+        .prepare(`UPDATE job_candidates SET status = ?, error = ?, updated_at = ? WHERE job_id = ? AND status = 'pending'`)
+        .run(status, error, new Date().toISOString(), jobId).changes,
+    );
+  }
+
+  jobCandidateCounts(jobId: string): Record<string, number> {
+    const rows = this.db.prepare("SELECT status, COUNT(*) AS n FROM job_candidates WHERE job_id = ? GROUP BY status").all(jobId) as Row[];
+    return Object.fromEntries(rows.map((r) => [r.status as string, r.n as number]));
+  }
+
+  /** Terms still waiting for a rank check across running jobs. */
+  pendingSummary(): { runningJobs: number; pendingTerms: number } {
+    const r = this.db
+      .prepare(
+        `SELECT COUNT(DISTINCT j.id) AS jobs, COUNT(c.term) AS terms FROM jobs j
+         LEFT JOIN job_candidates c ON c.job_id = j.id AND c.status = 'pending'
+         WHERE j.status = 'running'`,
+      )
+      .get() as Row;
+    return { runningJobs: r.jobs as number, pendingTerms: r.terms as number };
+  }
+
   // ------------------------------------------------------------ suggestions cache
 
   getSuggestions(term: string, country: string, ttlMs = DEFAULT_SUGGESTION_TTL_MS): { suggestions: string[]; fetchedAt: string } | null {
@@ -286,6 +399,21 @@ export class ScreenStore {
       lastSuggestionAt: (sugg.last as string | null) ?? null,
     };
   }
+}
+
+function mapJob(r: Row): JobRecord & { cancelRequested: boolean } {
+  return {
+    id: r.id as string,
+    kind: r.kind as JobRecord["kind"],
+    status: r.status as JobStatus,
+    pid: (r.pid as number | null) ?? null,
+    createdAt: r.created_at as string,
+    updatedAt: r.updated_at as string,
+    finishedAt: (r.finished_at as string | null) ?? null,
+    cancelRequested: r.cancel_requested === 1,
+    input: JSON.parse(r.input as string),
+    state: JSON.parse(r.state as string),
+  };
 }
 
 function mapRank(r: Row): RankRow {

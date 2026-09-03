@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { summarizeTop10, looksLikeAppName, rankFromResults, normalizeTerm, checkRankBatch, type AppResult } from "../dist/apple.js";
-import { appleLimiter } from "../dist/ratelimit.js";
+import { searchLimiter } from "../dist/ratelimit.js";
 
 const now = Date.parse("2026-09-03T00:00:00Z");
 const app = (i: number, extra: Partial<AppResult> = {}): AppResult => ({
@@ -59,8 +59,8 @@ test("looksLikeAppName flags titles and leaves queries alone", () => {
 });
 
 test("checkRankBatch retries rate limits, records errors, honours skip and onResult", async () => {
-  appleLimiter.reset();
-  appleLimiter.paceMs = 0;
+  searchLimiter.reset();
+  searchLimiter.paceMs = 0;
   const origFetch = globalThis.fetch;
   let calls = 0;
   globalThis.fetch = (async (url: string | URL) => {
@@ -91,13 +91,13 @@ test("checkRankBatch retries rate limits, records errors, honours skip and onRes
     assert.equal(boom.attempts, 2);
   } finally {
     globalThis.fetch = origFetch;
-    appleLimiter.reset();
+    searchLimiter.reset();
   }
 });
 
 test("checkRankBatch aborts after sustained rate limiting and keeps completed results", async () => {
-  appleLimiter.reset();
-  appleLimiter.paceMs = 0;
+  searchLimiter.reset();
+  searchLimiter.paceMs = 0;
   const origFetch = globalThis.fetch;
   let calls = 0;
   globalThis.fetch = (async (url: string | URL) => {
@@ -115,6 +115,6 @@ test("checkRankBatch aborts after sustained rate limiting and keeps completed re
     assert.equal(calls, 1 + 6);
   } finally {
     globalThis.fetch = origFetch;
-    appleLimiter.reset();
+    searchLimiter.reset();
   }
 });

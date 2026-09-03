@@ -1,6 +1,6 @@
 {
   "name": "altis-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server for Altis ASO (tryaltis.com): reads the local Altis macOS app database and queries the App Store for live keyword data.",
   "type": "module",
   "bin": {
