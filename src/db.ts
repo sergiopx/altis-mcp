@@ -2,13 +2,16 @@
  * Read-only access to the Altis ASO local database.
  *
  * Altis stores everything in a SwiftData (Core Data) SQLite file inside its
- * sandbox container. We open it read-only; the store runs in WAL mode so this
- * is safe while the app is running and writing.
+ * sandbox container, in WAL mode. Recent commits live in `default.store-wal`
+ * until Altis checkpoints, so reading the main file alone lags by minutes. We
+ * copy the main file plus its -wal and -shm siblings to a private temp dir and
+ * open the copy, which lets SQLite replay the WAL without ever touching (or
+ * locking) the live files. The copy is deleted on close().
  */
 import { DatabaseSync } from "node:sqlite";
-import { existsSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
+import { copyFileSync, existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, join } from "node:path";
 
 export const DEFAULT_STORE_PATH = join(
   homedir(),
@@ -222,9 +225,55 @@ const ORDER_COLUMNS: Record<NonNullable<KeywordFilter["orderBy"]>, string> = {
 
 type Row = Record<string, unknown>;
 
+export interface WalInfo {
+  /** True when the store was snapshotted (main + -wal + -shm) before opening. */
+  copied: boolean;
+  walBytes: number;
+  walMtime: string | null;
+}
+
+function fileStamp(p: string): string {
+  if (!existsSync(p)) return "missing";
+  const st = statSync(p);
+  return `${st.size}:${st.mtimeMs}`;
+}
+
+/**
+ * Copy the SQLite main file and its WAL/SHM siblings into a fresh temp dir.
+ * Altis may be writing concurrently, so the copy is retried when the WAL
+ * changed while we were copying (a torn snapshot). SQLite ignores a partial
+ * trailing WAL frame, but main-file/WAL skew is avoided outright this way.
+ * Returns the copied main-file path, the temp dir, and WAL size for diagnostics.
+ */
+export function snapshotStore(path: string, maxAttempts = 4): { copyPath: string; dir: string; wal: WalInfo } {
+  const dir = mkdtempSync(join(tmpdir(), "altis-mcp-"));
+  const name = basename(path);
+  for (let attempt = 1; ; attempt++) {
+    const before = [path, path + "-wal"].map(fileStamp).join("|");
+    for (const suffix of ["", "-wal", "-shm"]) {
+      const src = path + suffix;
+      if (existsSync(src)) copyFileSync(src, join(dir, name + suffix));
+      else rmSync(join(dir, name + suffix), { force: true });
+    }
+    const after = [path, path + "-wal"].map(fileStamp).join("|");
+    if (before === after || attempt >= maxAttempts) {
+      let walBytes = 0;
+      let walMtime: string | null = null;
+      if (existsSync(path + "-wal")) {
+        const st = statSync(path + "-wal");
+        walBytes = st.size;
+        walMtime = st.mtime.toISOString();
+      }
+      return { copyPath: join(dir, name), dir, wal: { copied: true, walBytes, walMtime } };
+    }
+  }
+}
+
 export class AltisStore {
   private db: DatabaseSync;
   readonly path: string;
+  readonly wal: WalInfo;
+  private tempDir: string | null = null;
 
   constructor(path = storePath()) {
     if (!existsSync(path)) {
@@ -234,11 +283,42 @@ export class AltisStore {
       );
     }
     this.path = path;
-    this.db = new DatabaseSync(path, { readOnly: true });
+    const snap = snapshotStore(path);
+    this.tempDir = snap.dir;
+    this.wal = snap.wal;
+    // The copy is private, so a read-write open is safe and lets SQLite replay the WAL.
+    this.db = new DatabaseSync(snap.copyPath);
   }
 
   close(): void {
     this.db.close();
+    if (this.tempDir) {
+      rmSync(this.tempDir, { recursive: true, force: true });
+      this.tempDir = null;
+    }
+  }
+
+  /** Keyword count for one tracked app, straight from the (WAL-fresh) store. */
+  keywordCount(appId: number): number {
+    return (this.db.prepare("SELECT COUNT(*) AS c FROM ZKEYWORD WHERE ZTRACKEDAPP = ?").get(appId) as Row).c as number;
+  }
+
+  /** Lowercased keyword texts tracked for an app (optionally one country). */
+  trackedTexts(appId?: number, countryCode?: string): Set<string> {
+    const where: string[] = [];
+    const params: (string | number)[] = [];
+    if (appId !== undefined) {
+      where.push("ZTRACKEDAPP = ?");
+      params.push(appId);
+    }
+    if (countryCode) {
+      where.push("UPPER(ZCOUNTRYCODE) = ?");
+      params.push(countryCode.toUpperCase());
+    }
+    const rows = this.db
+      .prepare(`SELECT ZTEXT FROM ZKEYWORD ${where.length ? `WHERE ${where.join(" AND ")}` : ""}`)
+      .all(...params) as Row[];
+    return new Set(rows.map((r) => String(r.ZTEXT ?? "").toLowerCase()).filter(Boolean));
   }
 
   private mapApp(r: Row): TrackedApp {
