@@ -21,7 +21,8 @@
     "inspect": "npx @modelcontextprotocol/inspector node dist/index.js",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "pnpm build",
-    "test": "tsc && node --test \"test/**/*.test.ts\""
+    "test": "tsc && node --test \"test/**/*.test.ts\"",
+    "prototype:pace": "node scripts/prototype-pace-probe.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.0",
