@@ -1,13 +1,17 @@
 /**
  * Background jobs for the screening loop.
  *
- * A job runs two workers over an in-memory queue:
- *   - expansion: walks seeds × suffixes through (cached) autocomplete, filters
- *     app titles / tracked / excluded terms, and pushes new candidates;
- *   - rank: consumes candidates as soon as they exist and rank-checks them
- *     through the search limiter, persisting each result immediately.
- * So the first rank check runs seconds after the job starts instead of after
- * the whole seed list has been expanded.
+ * A screen job runs in three phases:
+ *   - expanding: walks seeds × suffixes through (cached) autocomplete, adds
+ *     seed × modifier combos, filters app titles / tracked / excluded / off-topic
+ *     terms, and stores every surviving candidate at once (status `candidate`);
+ *   - selecting: once every seed is expanded, applies maxCandidates globally:
+ *     seeds first, then autocomplete-sourced, then combos, round-robin across
+ *     seeds inside each class so early seeds cannot starve later ones. The rest
+ *     become `truncated`. Expand-only jobs stop here;
+ *   - checking: rank-checks the selection through the search limiter,
+ *     persisting each result immediately.
+ * Selection needs the whole candidate pool, so checks start after expansion.
  *
  * Async jobs run in a detached worker process (dist/worker.js <jobId>) so they
  * survive the MCP client: stdio clients SIGTERM the server they spawned when
@@ -15,20 +19,24 @@
  * the same Job class in-process and await it.
  *
  * State is mirrored to screen.sqlite on every step (heartbeat = updated_at),
- * so any server process can report it. Cancellation is a flag in the store
- * that the workers poll, which also works across processes. A running job
+ * so any server process can report it. Cancellation and pace changes are
+ * fields in the store that the workers poll, which also works across
+ * processes. A 403 never fails a job: the limiter's backoff is waited out and
+ * the call retried, in every phase; cancel is the only exit. A running job
  * whose worker pid is dead, or whose heartbeat is older than STALE_MS, is
- * reported as aborted.
+ * reported as aborted and its pending candidates released.
  */
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { MAX_CONSECUTIVE_RATE_LIMITS, checkOneWithRetry, normalizeTerm, summarizeTop10, type BatchItemResult, type RetryState } from "./apple.js";
+import { checkOneWithRetry, normalizeTerm, summarizeTop10, type BatchItemResult, type RetryState } from "./apple.js";
 import { AppleRateLimitError } from "./ratelimit.js";
 import { rateStatus, searchLimiter, suggestLimiter } from "./ratelimit.js";
-import { ScreenStore, type JobRecord, type JobStatus } from "./screenstore.js";
+import { attachSharedLimiters } from "./limiterstore.js";
+import { ScreenStore, type CandidateSource, type JobRecord, type JobStatus } from "./screenstore.js";
 import { suggestionsWithFlags } from "./suggest.js";
+import { defaultIncludeAny, matchesAny } from "./terms.js";
 
 export const STALE_MS = 15 * 60_000;
 export const DEFAULT_SUFFIXES = ["", "calc", "c", "l", "t", "a", "p"];
@@ -40,8 +48,11 @@ export interface ScreenJobInput {
   countries: string[];
   suffixes: string[];
   modifiers: string[];
+  /** Whole-word phrases; a candidate containing any of them is dropped. */
   exclude: string[];
   tracked: string[];
+  /** Whole-word words; a candidate must contain at least one. Undefined = the seed words (see defaultIncludeAny). */
+  includeAny?: string[];
   maxCandidates: number;
   rescreenAfterDays: number;
   depth: number;
@@ -75,7 +86,7 @@ export interface RecentCheck {
 }
 
 export interface JobState {
-  phase: "expanding" | "checking" | "finished";
+  phase: "expanding" | "selecting" | "checking" | "finished";
   seedsTotal: number;
   seedsExpanded: number;
   queriesTotal: number;
@@ -85,13 +96,17 @@ export interface JobState {
   serpCalls: number;
   /** Autocomplete/SERP queries that failed for a non-throttling reason and were skipped. */
   queryErrors: number;
-  /** Rate-limit responses seen during expansion (retried after backoff). */
+  /** Rate-limit responses seen during expansion (each waited out and retried). */
   expansionRateLimits: number;
   rawSuggestions: number;
   candidatesFound: number;
   candidatesSkipped: number;
   candidatesTruncated: number;
-  dropped: { appNames: number; excluded: number; tracked: number; tooShort: number };
+  /** Candidates cut by maxCandidates, per seed. */
+  truncatedBySeed: Record<string, number>;
+  /** The includeAny filter in force (explicit or derived from the seeds). */
+  includeAny: string[];
+  dropped: { appNames: number; excluded: number; tracked: number; tooShort: number; notIncluded: number };
   checksTotal: number;
   checksDone: number;
   checksOk: number;
@@ -99,6 +114,8 @@ export interface JobState {
   rateLimits: number;
   backoffSeconds: number;
   etaSeconds: number | null;
+  /** Search spacing actually enforced for this job's calls (floor × adaptive multiplier, or the job's own pace if longer). */
+  effectiveSearchPaceMs: number;
   /** Limiter state of the process running the job (the worker), captured at the last heartbeat. */
   rate: ReturnType<typeof rateStatus> | null;
   recent: RecentCheck[];
@@ -111,10 +128,10 @@ function newState(): JobState {
     phase: "expanding",
     seedsTotal: 0, seedsExpanded: 0, queriesTotal: 0, queriesDone: 0,
     suggestionCalls: 0, suggestionCacheHits: 0, serpCalls: 0, queryErrors: 0, expansionRateLimits: 0, rawSuggestions: 0,
-    candidatesFound: 0, candidatesSkipped: 0, candidatesTruncated: 0,
-    dropped: { appNames: 0, excluded: 0, tracked: 0, tooShort: 0 },
+    candidatesFound: 0, candidatesSkipped: 0, candidatesTruncated: 0, truncatedBySeed: {}, includeAny: [],
+    dropped: { appNames: 0, excluded: 0, tracked: 0, tooShort: 0, notIncluded: 0 },
     checksTotal: 0, checksDone: 0, checksOk: 0, checksFailed: 0,
-    rateLimits: 0, backoffSeconds: 0, etaSeconds: null, rate: null, recent: [], error: null, warning: null,
+    rateLimits: 0, backoffSeconds: 0, etaSeconds: null, effectiveSearchPaceMs: 0, rate: null, recent: [], error: null, warning: null,
   };
 }
 
@@ -125,7 +142,7 @@ class CancelledError extends Error {
   }
 }
 
-/** Candidate queue shared by the two workers. */
+/** Candidate queue consumed by the rank worker. */
 class Queue<T> {
   private items: T[] = [];
   private closed = false;
@@ -163,6 +180,53 @@ class Queue<T> {
   }
 }
 
+// ------------------------------------------------------------ selection
+
+export interface Candidate {
+  term: string;
+  source: CandidateSource;
+  seed: string;
+}
+
+const SOURCE_ORDER: CandidateSource[] = ["seed", "autocomplete", "combo"];
+
+/**
+ * Apply maxCandidates to the whole pool: seeds first, then autocomplete
+ * suggestions, then combos; inside each class take one candidate per seed in
+ * turn (round-robin, seeds in first-seen order) until the budget is spent.
+ */
+export function selectCandidates(pool: Candidate[], max: number): { selected: Candidate[]; truncated: Candidate[] } {
+  const selected: Candidate[] = [];
+  const truncated: Candidate[] = [];
+  let budget = Math.max(0, max);
+  for (const source of SOURCE_ORDER) {
+    const bySeed = new Map<string, Candidate[]>();
+    for (const c of pool) {
+      if (c.source !== source) continue;
+      const list = bySeed.get(c.seed);
+      if (list) list.push(c);
+      else bySeed.set(c.seed, [c]);
+    }
+    const lanes = [...bySeed.values()];
+    let progressed = true;
+    while (progressed) {
+      progressed = false;
+      for (const lane of lanes) {
+        const c = lane.shift();
+        if (!c) continue;
+        progressed = true;
+        if (budget > 0) {
+          selected.push(c);
+          budget -= 1;
+        } else truncated.push(c);
+      }
+    }
+  }
+  return { selected, truncated };
+}
+
+// ------------------------------------------------------------ job
+
 export class Job {
   readonly id: string;
   readonly kind: JobInput["kind"];
@@ -174,7 +238,6 @@ export class Job {
   readonly results: BatchItemResult[] = [];
   private readonly abort = new AbortController();
   private readonly store: ScreenStore;
-  private readonly startedMs = Date.now();
   private checkDurations: number[] = [];
   private lastPersist = 0;
   /** Heartbeat so a worker sleeping through a long backoff still looks alive to other processes. */
@@ -200,6 +263,12 @@ export class Job {
     this.abort.abort(new CancelledError());
   }
 
+  /** Change the pacing of a running job in this process (the store copy is updated by the caller). */
+  setPace(patch: { searchPaceMs?: number; suggestPaceMs?: number }): void {
+    if ("searchPaceMs" in patch) this.input.searchPaceMs = patch.searchPaceMs;
+    if ("suggestPaceMs" in patch && this.input.kind === "screen") this.input.suggestPaceMs = patch.suggestPaceMs;
+  }
+
   record(): JobRecord {
     return {
       id: this.id,
@@ -219,25 +288,27 @@ export class Job {
     const rs = rateStatus();
     const s = this.state;
     s.backoffSeconds = Math.max(rs.search.currentBackoffSeconds, s.phase === "expanding" ? rs.autocomplete.currentBackoffSeconds : 0);
+    s.effectiveSearchPaceMs = Math.round(searchLimiter.effectivePace(this.input.searchPaceMs));
     s.etaSeconds = this.eta();
     s.rate = rs;
-    return { ...s, dropped: { ...s.dropped }, recent: [...s.recent] };
+    return { ...s, dropped: { ...s.dropped }, truncatedBySeed: { ...s.truncatedBySeed }, includeAny: [...s.includeAny], recent: [...s.recent] };
   }
 
   private eta(): number | null {
     if (this.status !== "running") return 0;
     const s = this.state;
-    const searchPace = (this.input.searchPaceMs ?? searchLimiter.paceMs) / 1000;
+    const searchPace = searchLimiter.effectivePace(this.input.searchPaceMs) / 1000;
     const avgCheck = this.checkDurations.length ? this.checkDurations.reduce((a, b) => a + b, 0) / this.checkDurations.length / 1000 : searchPace;
     const remainingChecks = Math.max(0, s.checksTotal - s.checksDone);
     let eta = remainingChecks * Math.max(avgCheck, searchPace);
     if (s.phase === "expanding" && this.input.kind === "screen") {
       const remainingQueries = Math.max(0, s.queriesTotal - s.queriesDone);
-      const suggestPace = (this.input.suggestPaceMs ?? suggestLimiter.paceMs) / 1000;
-      // Expansion and checking overlap; the longer of the two bounds the job. Guess more candidates are coming at the observed rate.
+      const suggestPace = suggestLimiter.effectivePace(this.input.suggestPaceMs) / 1000;
+      // Checks follow expansion. Guess how many candidates are still coming at the observed rate, capped by the budget.
       const perQuery = s.queriesDone ? s.candidatesFound / s.queriesDone : 2;
-      const expected = remainingQueries * perQuery * this.input.countries.length;
-      eta = Math.max(remainingQueries * suggestPace, (remainingChecks + expected) * Math.max(avgCheck, searchPace));
+      const expected = Math.min(this.input.maxCandidates, s.candidatesFound + remainingQueries * perQuery);
+      const checks = this.input.expandOnly ? 0 : expected * this.input.countries.length;
+      eta = remainingQueries * suggestPace + (s.seedsTotal - s.seedsExpanded) * searchPace /* one SERP per seed */ + checks * Math.max(avgCheck, searchPace);
     }
     return Math.round(eta + s.backoffSeconds);
   }
@@ -249,9 +320,18 @@ export class Job {
     this.store.saveJob(this.record());
   }
 
-  private checkCancel(): void {
+  /** Between steps: honour a cancel request and pick up pace changes made through the store. */
+  private poll(): void {
     if (this.abort.signal.aborted) throw new CancelledError();
-    if (this.store.jobCancelRequested(this.id)) this.cancel(), this.checkCancel();
+    const rec = this.store.getJob(this.id);
+    if (!rec) return;
+    if (rec.cancelRequested) {
+      this.cancel();
+      throw new CancelledError();
+    }
+    const stored = rec.input as Partial<ScreenJobInput>;
+    this.input.searchPaceMs = stored.searchPaceMs;
+    if (this.input.kind === "screen") this.input.suggestPaceMs = stored.suggestPaceMs;
   }
 
   private finish(status: JobStatus, error?: string): void {
@@ -269,7 +349,7 @@ export class Job {
       else await this.runScreen(this.input);
       if (this.status === "running") this.finish("done");
     } catch (e) {
-      if (this.status !== "running") return; // already finished (e.g. aborted by the rank worker)
+      if (this.status !== "running") return;
       if (e instanceof CancelledError || this.abort.signal.aborted) this.finish("cancelled", "Cancelled");
       else this.finish("failed", e instanceof Error ? e.message : String(e));
     }
@@ -299,25 +379,21 @@ export class Job {
     this.persist();
   }
 
-  /** Consume the queue until it is closed and drained. Returns false if the batch aborted on sustained 403s. */
-  private async rankWorker(queue: Queue<{ term: string; country: string }>, appId: string, depth: number, paceMs: number | undefined, source: string): Promise<void> {
+  /** Consume the queue until it is closed and drained. Rate limits are waited out indefinitely; only cancel stops the worker. */
+  private async rankWorker(queue: Queue<{ term: string; country: string }>, appId: string, depth: number, source: string): Promise<void> {
     const retry: RetryState = { consecutiveRateLimits: 0, rateLimitHits: 0 };
     for (;;) {
       const next = await queue.next(this.abort.signal);
-      this.checkCancel();
+      this.poll();
       if (!next) return;
-      if (this.state.phase === "expanding" && queue.isClosed) this.state.phase = "checking";
       const t0 = Date.now();
-      const { item, aborted } = await checkOneWithRetry(next.term, appId, next.country, retry, { depth, paceMs, signal: this.abort.signal });
+      const { item } = await checkOneWithRetry(next.term, appId, next.country, retry, {
+        depth, paceMs: this.input.searchPaceMs, signal: this.abort.signal, maxConsecutiveRateLimits: Infinity,
+      });
       this.state.rateLimits = retry.rateLimitHits;
       this.checkDurations.push(Date.now() - t0);
       if (this.checkDurations.length > 50) this.checkDurations.shift();
       this.noteResult(item, false, source);
-      if (aborted) {
-        this.finish("aborted", `Stopped after ${retry.consecutiveRateLimits} consecutive rate-limit responses on the search endpoint; retry later`);
-        this.abort.abort(new CancelledError()); // stop the expansion worker too, so the process exits
-        return;
-      }
     }
   }
 
@@ -348,68 +424,63 @@ export class Job {
     for (const country of input.countries) for (const term of terms) this.enqueue(queue, term, country, input.appId, maxAgeMs);
     queue.close();
     this.persist(true);
-    await this.rankWorker(queue, input.appId, input.depth, input.searchPaceMs, "batch");
+    await this.rankWorker(queue, input.appId, input.depth, "batch");
   }
 
   // ------------------------------------------------------------ screen
 
   private async runScreen(input: ScreenJobInput): Promise<void> {
     const s = this.state;
-    const queue = new Queue<{ term: string; country: string }>();
     const seeds = [...new Set(input.seeds.map(normalizeTerm).filter(Boolean))];
     const primary = input.countries[0];
     const maxAgeMs = input.rescreenAfterDays * 86_400_000;
-    const excluded = new Set(input.exclude.map(normalizeTerm));
+    const excluded = input.exclude.map(normalizeTerm).filter(Boolean);
     const tracked = new Set(input.tracked.map(normalizeTerm));
+    const includeAny = input.includeAny ?? defaultIncludeAny(seeds);
+    s.includeAny = includeAny;
     s.seedsTotal = seeds.length;
     s.queriesTotal = seeds.length * input.suffixes.length;
     this.persist(true);
 
+    // ---- expanding
     const seen = new Map<string, boolean>(); // normalized term -> isAppName
-    let accepted = 0;
-    const consider = (term: string, isAppName: boolean) => {
+    const pool: Candidate[] = [];
+    const consider = (term: string, source: CandidateSource, seed: string, isAppName: boolean) => {
       if (!term) return;
       const prev = seen.get(term);
       if (prev !== undefined) {
-        if (isAppName && !prev) seen.set(term, true); // learned later that it is a title; already queued rows stay
+        if (isAppName && !prev) seen.set(term, true); // learned later that it is a title; already stored rows stay
         return;
       }
       seen.set(term, isAppName);
       s.rawSuggestions += 1;
       if (isAppName) return void (s.dropped.appNames += 1);
-      if (excluded.has(term)) return void (s.dropped.excluded += 1);
+      if (matchesAny(term, excluded)) return void (s.dropped.excluded += 1);
       if (tracked.has(term)) return void (s.dropped.tracked += 1);
       if (term.length < 3) return void (s.dropped.tooShort += 1);
-      if (accepted >= input.maxCandidates) return void (s.candidatesTruncated += 1);
-      accepted += 1;
+      if (source !== "seed" && includeAny.length && !matchesAny(term, includeAny)) return void (s.dropped.notIncluded += 1);
+      pool.push({ term, source, seed });
       s.candidatesFound += 1;
-      if (!input.expandOnly) for (const c of input.countries) this.enqueue(queue, term, c, input.appId, maxAgeMs);
+      for (const c of input.countries) this.store.addJobCandidate(this.id, term, c, "candidate", source, seed);
     };
 
-    /** One autocomplete query with the retry policy: rate limits wait out the backoff and retry; other errors skip the query. */
-    const expandQuery = async (q: string, seed: string, namesBySeed: Map<string, string[]>, streak: { n: number }) => {
+    /** One autocomplete query: rate limits wait out the backoff and retry; other errors skip the query. */
+    const expandQuery = async (q: string, seed: string, namesBySeed: Map<string, string[]>) => {
       for (;;) {
-        this.checkCancel();
+        this.poll();
         try {
-          const res = await suggestionsWithFlags(this.store, q, primary, {
+          return await suggestionsWithFlags(this.store, q, primary, {
             signal: this.abort.signal,
             paceMs: input.suggestPaceMs,
             serpPaceMs: input.searchPaceMs,
             extraNames: namesBySeed.get(seed),
             serpLookup: !namesBySeed.has(seed),
           });
-          streak.n = 0;
-          return res;
         } catch (e) {
           if (this.abort.signal.aborted) throw e;
           if (e instanceof AppleRateLimitError) {
             s.expansionRateLimits += 1;
-            streak.n += 1;
-            if (streak.n >= MAX_CONSECUTIVE_RATE_LIMITS) {
-              this.finish("aborted", `Stopped after ${streak.n} consecutive rate-limit responses on the ${e.endpoint} endpoint during expansion; retry later`);
-              this.abort.abort(new CancelledError());
-              throw new CancelledError();
-            }
+            this.persist(true);
             continue; // the limiter's backoff makes the next attempt wait
           }
           s.queryErrors += 1;
@@ -419,46 +490,47 @@ export class Job {
       }
     };
 
-    const expansion = (async () => {
-      try {
-        const namesBySeed = new Map<string, string[]>();
-        const streak = { n: 0 };
-        for (const seed of seeds) {
-          consider(seed, false); // seeds are queries by definition
-          for (const suf of input.suffixes) {
-            const q = suf ? `${seed} ${suf}` : seed;
-            const res = await expandQuery(q, seed, namesBySeed, streak);
-            s.queriesDone += 1;
-            if (!res) {
-              this.persist();
-              continue;
-            }
-            if (!namesBySeed.has(seed)) namesBySeed.set(seed, res.namesUsed);
-            if (res.fromCache) s.suggestionCacheHits += 1;
-            else s.suggestionCalls += 1;
-            s.serpCalls += res.serpCalls;
-            for (const sg of res.suggestions) consider(normalizeTerm(sg.term), sg.isAppName === true);
-            this.persist();
-          }
-          for (const m of input.modifiers) consider(normalizeTerm(`${seed} ${m}`), false);
-          s.seedsExpanded += 1;
+    const namesBySeed = new Map<string, string[]>();
+    for (const seed of seeds) {
+      consider(seed, "seed", seed, false); // seeds are queries by definition
+      for (const suf of input.suffixes) {
+        const q = suf ? `${seed} ${suf}` : seed;
+        const res = await expandQuery(q, seed, namesBySeed);
+        s.queriesDone += 1;
+        if (!res) {
           this.persist();
+          continue;
         }
-      } finally {
-        queue.close();
-        if (s.phase === "expanding") s.phase = "checking";
-        this.persist(true);
+        if (!namesBySeed.has(seed)) namesBySeed.set(seed, res.namesUsed);
+        if (res.fromCache) s.suggestionCacheHits += 1;
+        else s.suggestionCalls += 1;
+        s.serpCalls += res.serpCalls;
+        for (const sg of res.suggestions) consider(normalizeTerm(sg.term), "autocomplete", seed, sg.isAppName === true);
+        this.persist();
       }
-    })();
-
-    if (input.expandOnly) {
-      await expansion;
-      return;
+      for (const m of input.modifiers) consider(normalizeTerm(`${seed} ${m}`), "combo", seed, false);
+      s.seedsExpanded += 1;
+      this.persist();
     }
-    const rank = this.rankWorker(queue, input.appId, input.depth, input.searchPaceMs, "screen");
-    // If expansion throws (e.g. autocomplete rate-limited out), stop the rank worker too.
-    const results = await Promise.allSettled([expansion, rank]);
-    for (const r of results) if (r.status === "rejected") throw r.reason;
+
+    // ---- selecting
+    s.phase = "selecting";
+    this.persist(true);
+    const { selected, truncated } = selectCandidates(pool, input.maxCandidates);
+    if (truncated.length) {
+      this.store.markTruncated(this.id, truncated.map((c) => c.term));
+      s.candidatesTruncated = truncated.length;
+      for (const c of truncated) s.truncatedBySeed[c.seed] = (s.truncatedBySeed[c.seed] ?? 0) + 1;
+    }
+    if (input.expandOnly) return;
+
+    // ---- checking
+    s.phase = "checking";
+    const queue = new Queue<{ term: string; country: string }>();
+    for (const c of selected) for (const country of input.countries) this.enqueue(queue, c.term, country, input.appId, maxAgeMs);
+    queue.close();
+    this.persist(true);
+    await this.rankWorker(queue, input.appId, input.depth, "screen");
   }
 }
 
@@ -484,19 +556,23 @@ export function startJob(input: JobInput): Job {
 /**
  * Persist the job and hand it to a detached worker process. Returns at once.
  * The worker is in its own process group and ignores our stdio, so the MCP
- * client's SIGTERM on disconnect never reaches it.
+ * client's SIGTERM on disconnect never reaches it. Dead jobs are swept first.
  */
 export function startDetachedJob(input: JobInput, store: ScreenStore): { id: string; state: JobState } {
+  reconcileRunning(store);
   const id = newJobId(input.kind);
   const now = new Date().toISOString();
   const state = newState();
   if (input.kind === "screen") {
-    state.seedsTotal = new Set(input.seeds.map(normalizeTerm).filter(Boolean)).size;
+    const seeds = [...new Set(input.seeds.map(normalizeTerm).filter(Boolean))];
+    state.seedsTotal = seeds.length;
     state.queriesTotal = state.seedsTotal * input.suffixes.length;
+    state.includeAny = input.includeAny ?? defaultIncludeAny(seeds);
   } else {
     state.phase = "checking";
     state.checksTotal = new Set(input.terms.map((t) => t.trim().toLowerCase()).filter(Boolean)).size * input.countries.length;
   }
+  state.effectiveSearchPaceMs = Math.round(searchLimiter.effectivePace(input.searchPaceMs));
   store.saveJob({ id, kind: input.kind, status: "running", pid: null, createdAt: now, updatedAt: now, finishedAt: null, input, state });
   const workerPath = join(dirname(fileURLToPath(import.meta.url)), "worker.js");
   const child = spawn(process.execPath, [workerPath, id], { detached: true, stdio: "ignore", env: process.env });
@@ -506,6 +582,7 @@ export function startDetachedJob(input: JobInput, store: ScreenStore): { id: str
 
 /** Entry point for dist/worker.js: run a persisted job to completion. */
 export async function runWorker(id: string): Promise<void> {
+  attachSharedLimiters();
   const store = new ScreenStore();
   const rec = store.getJob(id);
   if (!rec) throw new Error(`No job ${id}`);
@@ -522,7 +599,8 @@ export async function runWorker(id: string): Promise<void> {
   }
 }
 
-function pidAlive(pid: number | null): boolean | null {
+/** true = alive (or alive but not ours: EPERM), false = gone, null = unknown pid. */
+export function pidAlive(pid: number | null): boolean | null {
   if (!pid) return null;
   try {
     process.kill(pid, 0);
@@ -579,7 +657,8 @@ export function jobStatus(store: ScreenStore, id: string): JobView | null {
 /**
  * A job marked running in the store whose worker pid is dead, or that never
  * got a worker (no pid a minute after creation), or whose heartbeat stopped
- * for STALE_MS, belongs to a dead process: report it as aborted.
+ * for STALE_MS, belongs to a dead process: report it as aborted and release
+ * its pending candidates.
  */
 function reconcile(store: ScreenStore, rec: JobRecord & { cancelRequested: boolean }): JobRecord & { cancelRequested: boolean } {
   if (rec.status !== "running" || jobs.has(rec.id)) return rec;
@@ -624,4 +703,29 @@ export function cancelJob(store: ScreenStore, id: string): { found: boolean; sta
   if (!rec) return { found: false, note: "No such job" };
   if (rec.status !== "running") return { found: true, status: rec.status, note: "Job had already finished" };
   return { found: true, status: "running", note: "Cancel requested in the store; the owning process stops at its next step" };
+}
+
+/**
+ * Change a running job's pacing. The store copy is patched (the owning worker
+ * re-reads it before its next Apple call) and a job in this process is updated
+ * at once. The limiter floor still applies: a pace below it has no effect.
+ */
+export function updateJobPace(
+  store: ScreenStore,
+  id: string,
+  patch: { searchPaceMs?: number; suggestPaceMs?: number },
+): { found: boolean; status?: JobStatus; effectiveSearchPaceMs?: number; effectiveSuggestPaceMs?: number; note: string } {
+  const rec = store.getJob(id);
+  if (!rec) return { found: false, note: "No such job" };
+  if (rec.status !== "running") return { found: true, status: rec.status, note: "Job has already finished" };
+  store.updateJobInput(id, patch);
+  jobs.get(id)?.setPace(patch);
+  const input = { ...(rec.input as Partial<ScreenJobInput>), ...patch };
+  return {
+    found: true,
+    status: "running",
+    effectiveSearchPaceMs: Math.round(searchLimiter.effectivePace(input.searchPaceMs)),
+    effectiveSuggestPaceMs: Math.round(suggestLimiter.effectivePace(input.suggestPaceMs)),
+    note: jobs.has(id) ? "Applied to the running job" : "Stored; the owning process applies it before its next Apple call",
+  };
 }

@@ -20,7 +20,17 @@ import { registerAppStoreTools } from "./tools/appstore.js";
 import { registerAltisWriteTools } from "./tools/altis-write.js";
 import { registerScreenTools } from "./tools/screen.js";
 import { registerMetadataTools } from "./tools/metadata.js";
-import { screenStorePath } from "./screenstore.js";
+import { screenStorePath, withScreenStore } from "./screenstore.js";
+import { attachSharedLimiters } from "./limiterstore.js";
+import { reconcileRunning } from "./jobs.js";
+
+// One Apple budget across every altis-mcp process on this machine, and a sweep of jobs whose worker died.
+attachSharedLimiters();
+try {
+  await withScreenStore((s) => reconcileRunning(s));
+} catch {
+  // screening store unavailable: tools report the error when used
+}
 
 const server = new McpServer({ name: "altis-mcp", version: "0.2.0" });
 

@@ -329,6 +329,8 @@ export interface CheckOneOptions {
   depth?: number;
   paceMs?: number;
   maxRetries?: number;
+  /** Consecutive rate limits before giving up (default MAX_CONSECUTIVE_RATE_LIMITS; Infinity = wait forever, as jobs do). */
+  maxConsecutiveRateLimits?: number;
   signal?: AbortSignal;
 }
 
@@ -336,7 +338,8 @@ export interface CheckOneOptions {
  * One rank check with the batch retry policy: rate-limit responses wait out
  * the limiter's backoff and retry without counting against maxRetries; other
  * errors retry up to maxRetries. Returns `aborted: true` when the caller's
- * consecutive rate-limit streak reaches MAX_CONSECUTIVE_RATE_LIMITS.
+ * consecutive rate-limit streak reaches maxConsecutiveRateLimits (synchronous
+ * batches only; background jobs pass Infinity and wait out every backoff).
  */
 export async function checkOneWithRetry(
   term: string,
@@ -363,7 +366,7 @@ export async function checkOneWithRetry(
         state.consecutiveRateLimits += 1;
         rateLimited = true;
         attempts -= 1; // the limiter has armed its backoff; the next acquire() waits it out
-        if (state.consecutiveRateLimits >= MAX_CONSECUTIVE_RATE_LIMITS) {
+        if (state.consecutiveRateLimits >= (opts.maxConsecutiveRateLimits ?? MAX_CONSECUTIVE_RATE_LIMITS)) {
           return { item: { term, country: country.toUpperCase(), appId, attempts, error: lastError, rateLimited }, aborted: true };
         }
       }

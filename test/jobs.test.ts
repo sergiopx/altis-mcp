@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startJob, jobStatus, cancelJob, listJobs, STALE_MS } from "../dist/jobs.js";
+import { startJob, jobStatus, cancelJob, listJobs, pidAlive, selectCandidates, updateJobPace, STALE_MS, type Candidate } from "../dist/jobs.js";
 import { ScreenStore } from "../dist/screenstore.js";
 import { searchLimiter, suggestLimiter } from "../dist/ratelimit.js";
 import type { AppResult } from "../dist/apple.js";
@@ -50,7 +50,7 @@ test.beforeEach(() => {
   suggestLimiter.paceMs = 0;
 });
 
-test("screen job pipelines: rank checks start before expansion finishes", async () => {
+test("screen job: expansion completes and selection runs before the first rank check", async () => {
   const cleanup = useTempStore();
   const log: string[] = [];
   const restore = mockApple({ hintDelayMs: 15, log });
@@ -60,11 +60,14 @@ test("screen job pipelines: rank checks start before expansion finishes", async 
       tracked: ["plate calculator"], maxCandidates: 100, rescreenAfterDays: 7, depth: 50, expandOnly: false,
     });
     assert.equal(job.status, "running");
-    // Wait until at least one rank check completed while expansion is still going.
+    // No check may start before every seed is expanded (selection needs the whole pool).
     const until = Date.now() + 5000;
-    while (Date.now() < until && !(job.state.checksDone > 0 && job.state.seedsExpanded < job.state.seedsTotal)) await new Promise((r) => setTimeout(r, 5));
-    assert.ok(job.state.checksDone > 0, "a check ran");
-    assert.ok(job.state.seedsExpanded < job.state.seedsTotal, `expansion still running (${job.state.seedsExpanded}/${job.state.seedsTotal})`);
+    while (Date.now() < until && job.state.checksDone === 0) {
+      assert.equal(job.state.checksDone, 0);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    assert.equal(job.state.seedsExpanded, job.state.seedsTotal, "expansion finished before the first check");
+    assert.ok(log.filter((l) => l.startsWith("search:")).length > 0);
     await job.done;
     assert.equal(job.status, "done");
     const s = job.state;
@@ -73,6 +76,8 @@ test("screen job pipelines: rank checks start before expansion finishes", async 
     assert.ok(s.dropped.appNames >= 4, "title-looking suggestions dropped");
     assert.equal(s.dropped.tracked, 1);
     assert.equal(s.dropped.excluded, 1);
+    assert.deepEqual(s.includeAny, ["plate", "barbell", "wendler", "squat"], "includeAny defaults to the seed words");
+    assert.equal(s.candidatesTruncated, 0);
     assert.equal(s.checksDone, s.checksTotal);
     assert.equal(s.checksFailed, 0);
     assert.ok(s.recent.length > 0 && s.recent.length <= 10);
@@ -166,28 +171,122 @@ test("a running job from a dead process is reported as aborted once stale", () =
   }
 });
 
-test("sustained search rate limiting aborts the whole screen job, including expansion", async () => {
+test("pidAlive: our pid is alive, a huge pid is dead, pid 1 (EPERM) counts as alive, null is unknown", () => {
+  assert.equal(pidAlive(process.pid), true);
+  assert.equal(pidAlive(2_000_000_000), false);
+  assert.equal(pidAlive(1), true);
+  assert.equal(pidAlive(null), null);
+});
+
+test("selectCandidates: seeds, then autocomplete, then combos; round-robin across seeds inside a class", () => {
+  const c = (term: string, source: Candidate["source"], seed: string): Candidate => ({ term, source, seed });
+  const pool = [
+    c("a", "seed", "a"), c("a 1", "autocomplete", "a"), c("a 2", "autocomplete", "a"), c("a 3", "autocomplete", "a"), c("a x", "combo", "a"),
+    c("b", "seed", "b"), c("b 1", "autocomplete", "b"), c("b 2", "autocomplete", "b"), c("b x", "combo", "b"),
+    c("c", "seed", "c"), c("c 1", "autocomplete", "c"),
+  ];
+  const { selected, truncated } = selectCandidates(pool, 7);
+  assert.deepEqual(selected.map((x) => x.term), ["a", "b", "c", "a 1", "b 1", "c 1", "a 2"]);
+  assert.deepEqual(truncated.map((x) => x.term), ["b 2", "a 3", "a x", "b x"]);
+  assert.equal(selectCandidates(pool, 100).truncated.length, 0);
+  assert.equal(selectCandidates([], 5).selected.length, 0);
+});
+
+test("expand-only job stores every candidate with source and seed; truncation is global and round-robin; filters are whole-word", async () => {
   const cleanup = useTempStore();
   const origFetch = globalThis.fetch;
-  let hints = 0;
+  const hints: Record<string, string[]> = {
+    plate: ["plate calculator", "pay by plate chicago", "template maker", "plate calculator"],
+    wendler: ["wendler 531", "wendler calc", "wendler 531 app"],
+  };
   globalThis.fetch = (async (url: string | URL) => {
     const u = new URL(String(url));
-    if (u.hostname === "search.itunes.apple.com") {
-      hints++;
-      await new Promise((r) => setTimeout(r, 5));
-      const seed = u.searchParams.get("term")!.split(" ")[0];
-      return new Response(`<plist>${hintsXml([`${seed} calculator`, `${seed} tracker`])}</plist>`, { status: 200 });
-    }
-    return new Response("", { status: 403, headers: { "retry-after": "0" } });
+    const term = u.searchParams.get("term")!;
+    if (u.hostname === "search.itunes.apple.com") return new Response(`<plist>${hintsXml(hints[term] ?? [])}</plist>`, { status: 200 });
+    return new Response(JSON.stringify({ resultCount: 1, results: [app(42)] }), { status: 200 });
   }) as typeof fetch;
   try {
     const job = startJob({
-      kind: "screen", seeds: Array.from({ length: 40 }, (_, i) => `seed${i}`), appId: "42", countries: ["US"], suffixes: ["", "c"], modifiers: [], exclude: [], tracked: [],
+      kind: "screen", seeds: ["plate", "wendler"], appId: "42", countries: ["US"], suffixes: [""], modifiers: ["app"], exclude: ["pay by plate"], tracked: [],
+      maxCandidates: 4, rescreenAfterDays: 0, depth: 50, expandOnly: true,
+    });
+    await job.done;
+    assert.equal(job.status, "done");
+    const s = job.state;
+    assert.equal(s.dropped.excluded, 1, "'pay by plate chicago' matched the exclude phrase");
+    assert.equal(s.dropped.notIncluded, 1, "'template maker' contains no seed word ('plate' is not a whole word of it)");
+    // pool: seeds plate, wendler; autocomplete plate calculator, wendler 531, wendler calc, wendler 531 app; combos plate app, wendler app  → 8, budget 4
+    assert.equal(s.candidatesFound, 8);
+    assert.equal(s.candidatesTruncated, 4);
+    assert.deepEqual(s.truncatedBySeed, { wendler: 3, plate: 1 });
+    assert.equal(s.checksTotal, 0, "expand-only: no checks");
+    const store = new ScreenStore();
+    const counts = store.jobCandidateCounts(job.id);
+    assert.equal(counts.candidate, 4);
+    assert.equal(counts.truncated, 4);
+    assert.equal(counts.pending ?? 0, 0);
+    const all = store.listJobCandidates(job.id);
+    assert.equal(all.total, 8);
+    const selected = store.listJobCandidates(job.id, { status: "candidate" }).candidates.map((c) => `${c.source}:${c.seed}:${c.term}`).sort();
+    assert.deepEqual(selected, ["autocomplete:plate:plate calculator", "autocomplete:wendler:wendler 531", "seed:plate:plate", "seed:wendler:wendler"]);
+    assert.deepEqual(store.candidateCountsBySeed(job.id, "truncated"), { wendler: 3, plate: 1 });
+    assert.equal(store.pendingSummary().pendingTerms, 0, "candidate rows are not pending checks");
+    assert.equal(jobStatus(store, job.id)!.status, "done");
+    store.close();
+  } finally {
+    globalThis.fetch = origFetch;
+    cleanup();
+  }
+});
+
+test("screen_job_update changes the pace of a running job here and in the store", async () => {
+  const cleanup = useTempStore();
+  const log: string[] = [];
+  const restore = mockApple({ searchDelayMs: 20, log });
+  try {
+    const job = startJob({ kind: "batch", terms: Array.from({ length: 30 }, (_, i) => `term ${i}`), appId: "42", countries: ["US"], depth: 50, force: true, maxAgeHours: 0 });
+    const store = new ScreenStore();
+    const r = updateJobPace(store, job.id, { searchPaceMs: 7 });
+    assert.equal(r.found, true);
+    assert.equal(r.effectiveSearchPaceMs, 7, "above the (zero) test floor, so it applies");
+    assert.equal(job.input.searchPaceMs, 7);
+    assert.equal((store.getJob(job.id)!.input as { searchPaceMs?: number }).searchPaceMs, 7);
+    assert.equal(updateJobPace(store, "nope", { searchPaceMs: 1 }).found, false);
+    cancelJob(store, job.id);
+    await job.done;
+    store.close();
+  } finally {
+    restore();
+    cleanup();
+  }
+});
+
+test("sustained 403s never fail a job: every phase waits out the backoff and retries", async () => {
+  const cleanup = useTempStore();
+  const origFetch = globalThis.fetch;
+  let searches = 0;
+  globalThis.fetch = (async (url: string | URL) => {
+    const u = new URL(String(url));
+    if (u.hostname === "search.itunes.apple.com") {
+      const seed = u.searchParams.get("term")!.split(" ")[0];
+      return new Response(`<plist>${hintsXml([`${seed} calculator`, `${seed} tracker`])}</plist>`, { status: 200 });
+    }
+    searches++;
+    if (searches <= 9) return new Response("", { status: 403, headers: { "retry-after": "0" } }); // more than the old 6-strike limit
+    return new Response(JSON.stringify({ resultCount: 1, results: [app(42)] }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const job = startJob({
+      kind: "screen", seeds: ["seed1", "seed2"], appId: "42", countries: ["US"], suffixes: [""], modifiers: [], exclude: [], tracked: [],
       maxCandidates: 1000, rescreenAfterDays: 0, depth: 50, expandOnly: false,
     });
     await job.done;
-    assert.equal(job.status, "aborted");
-    assert.ok(job.state.seedsExpanded < 40, `expansion stopped early (${job.state.seedsExpanded})`);
+    assert.equal(job.status, "done", job.state.error ?? "");
+    assert.equal(job.state.seedsExpanded, 2);
+    assert.ok(job.state.expansionRateLimits + job.state.rateLimits >= 9, `all 403s retried (${job.state.expansionRateLimits} + ${job.state.rateLimits})`);
+    assert.equal(job.state.checksFailed, 0);
+    assert.equal(job.state.checksDone, job.state.checksTotal);
+    assert.ok(searchLimiter.adaptiveMultiplier > 1, "the process slowed itself down");
     const store = new ScreenStore();
     assert.equal(store.jobCandidateCounts(job.id).pending ?? 0, 0, "no pending rows left behind");
     store.close();

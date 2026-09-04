@@ -9,7 +9,8 @@ import { suggestionsWithFlags } from "../suggest.js";
 import { startDetachedJob, startJob, type BatchJobInput } from "../jobs.js";
 
 const PACING_NOTE =
-  "Search/lookup calls share one limiter (default 1.2 s apart) and autocomplete another (0.6 s); a 403/429 backs off only the endpoint that received it. See rate_status.";
+  "Search/lookup calls share one limiter (floor 1.5 s apart = 40/min, raised 50% per 403 for the rest of the process) and autocomplete another (0.6 s); a 403/429 backs off only the endpoint that received it. " +
+  "The budget is shared with other altis-mcp processes on this machine. See rate_status.";
 
 export function registerAppStoreTools(server: McpServer): void {
   server.registerTool(
@@ -129,7 +130,7 @@ export function registerAppStoreTools(server: McpServer): void {
         country: z.string().length(2).optional().describe("Single storefront (default us)"),
         countries: z.array(z.string().length(2)).optional().describe("Several storefronts; one row per term per country"),
         depth: z.number().int().min(10).max(200).optional().default(200),
-        paceMs: z.number().int().min(0).max(60_000).optional().describe("Override the search limiter spacing for this job"),
+        paceMs: z.number().int().min(0).max(60_000).optional().describe("Spacing for this job's search calls; can only raise the limiter floor, never lower it"),
         force: z.boolean().optional().default(false).describe("Re-check terms even if checked in the last 24 h"),
         maxAgeHours: z.number().min(0).optional().default(24).describe("Reuse stored results newer than this instead of refetching"),
         async: z.boolean().optional().default(false).describe("Return a jobId immediately instead of blocking"),
@@ -141,7 +142,7 @@ export function registerAppStoreTools(server: McpServer): void {
         const jobInput: BatchJobInput = { kind: "batch", terms, appId, countries: list, depth, searchPaceMs: paceMs, force, maxAgeHours };
         if (isAsync) {
           const { id, state } = await withScreenStore((s) => startDetachedJob(jobInput, s));
-          return json({ jobId: id, status: "running", checksTotal: state.checksTotal, note: "Runs in a detached worker process. Poll screen_job_status({ jobId }); results accumulate in screen_results" });
+          return json({ jobId: id, status: "running", checksTotal: state.checksTotal, paceMs: { requested: paceMs ?? null, effective: state.effectiveSearchPaceMs }, note: "Runs in a detached worker process. Poll screen_job_status({ jobId }); results accumulate in screen_results" });
         }
         const job = startJob(jobInput);
         await job.done;
@@ -151,6 +152,7 @@ export function registerAppStoreTools(server: McpServer): void {
           appId,
           countries: list,
           summary: { total: job.state.checksTotal, ok: job.state.checksOk, failed: job.state.checksFailed, skipped: job.state.candidatesSkipped, rateLimitHits: job.state.rateLimits, error: job.state.error },
+          paceMs: { requested: paceMs ?? null, effective: job.state.effectiveSearchPaceMs },
           rate: rateStatus(),
           results: job.results.map((r) => ({
             term: r.term,
@@ -176,7 +178,8 @@ export function registerAppStoreTools(server: McpServer): void {
     {
       title: "Apple rate-limit status",
       description:
-        "Throttle state of both Apple limiters (search/lookup and autocomplete): calls in the last minute, last 403/429 time, current backoff, and seconds until the next call is safe.",
+        "Throttle state of both Apple limiters (search/lookup and autocomplete): calls in the last minute, last 403/429 time, consecutive rate limits and clean calls since, current backoff, " +
+        "seconds until the next call is safe, the configured floor (paceMs), the adaptive multiplier and the effective pace, and whether the state is shared with other processes.",
       inputSchema: {},
     },
     async () => json(rateStatus()),
