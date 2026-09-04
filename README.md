@@ -49,7 +49,7 @@ Environment variables:
 | `ALTIS_STORE_PATH` | Altis container `default.store` | Altis SQLite store to read |
 | `ALTIS_METRICS_DIR` | `AltisASO/` beside the store | Altis JSON caches (metrics, competitors, intent, opportunity) |
 | `ALTIS_MCP_DATA_DIR` | `~/Library/Application Support/altis-mcp` | Server-owned screening store and autocomplete cache |
-| `ALTIS_MCP_PACE_SEARCH_MS` | `1500` | Minimum spacing between search/lookup calls (rank checks, SERPs) |
+| `ALTIS_MCP_PACE_SEARCH_MS` | `1500` | Floor for search/lookup spacing (rank checks, SERPs): 40 calls/min, measured safe on 2026-09-03. Raised ×1.5 per 403 (cap ×4) for the rest of the process |
 | `ALTIS_MCP_PACE_SUGGEST_MS` | `600` | Minimum spacing between autocomplete calls |
 
 ## Tools
@@ -83,15 +83,17 @@ Live App Store (Apple public endpoints; search and autocomplete each have their 
 | `appstore_suggestions` | Autocomplete suggestions, cached 7 days on disk, each flagged `isAppName` when it looks like an app title |
 | `appstore_check_rank` | Where an app ranks for a term right now, the top 10 with release dates and genre, and a `top10` summary |
 | `appstore_check_rank_batch` | Paced rank checks for many terms and countries; every result persisted as it completes; `async: true` returns a job id |
-| `rate_status` | Per-endpoint calls per minute, last 403/429, current backoff, seconds until the next safe call |
+| `rate_status` | Per-endpoint calls per minute, last 403/429, consecutive rate limits, current backoff, seconds until the next safe call, configured floor, adaptive multiplier and effective pace, and whether the budget is shared with other processes |
 
 Screening pipeline (server-owned SQLite store):
 
 | Tool | What it does |
 |---|---|
-| `screen` | Background job: seeds → cached autocomplete expansion (letter suffixes, modifiers) → dedupe → drop app titles, tracked and excluded terms → rank checks that start as soon as candidates exist. Returns a job id (`async: false` blocks) |
-| `screen_job_status` | Phase, seeds expanded, candidates found, checks done/total, rate limits, backoff, ETA, last 10 checks. Works across server processes and restarts |
-| `screen_job_cancel` | Stop a job after its current Apple call |
+| `screen` | Background job in three phases: expand every seed through cached autocomplete (letter suffixes, modifiers) and filter (app titles, tracked, whole-word `exclude` phrases, `includeAny` words defaulting to the seed words) → select `maxCandidates` from the whole pool (seeds, then autocomplete, then combos, round-robin across seeds) → rank-check the selection. A 403 never fails the job. Returns a job id (`async: false` blocks) |
+| `screen_candidates` | A job's candidates with source (`seed`, `autocomplete`, `combo`), seed and status (`candidate`, `truncated`, `pending`, `skipped`, `done`, `error`, `cancelled`), plus counts by status and truncated counts per seed. Available during expansion and for expand-only jobs |
+| `screen_job_status` | Phase (expanding, selecting, checking, finished), seeds expanded, candidates found and truncated, checks done/total, rate limits, backoff, effective pace, ETA, last 10 checks. Works across server processes and restarts; a job whose worker died is reported as aborted |
+| `screen_job_update` | Change a running job's search/autocomplete spacing without cancelling it, across processes |
+| `screen_job_cancel` | Stop a job after its current Apple call (the only way a job stops on sustained 403s) |
 | `screen_jobs` | Recent jobs with status and progress |
 | `screen_results` | Latest stored check per term with scoring inputs: position, maxReviews, sumReviews, avgRating, newestAgeDays, medianAgeDays, dominantGenre; plus pending-term counts of running jobs |
 | `screen_history` | Position series for one term |
@@ -118,8 +120,11 @@ Altis's keyword analysis (Top 10 competitors, intent, opportunity, advanced
 metrics) lives in JSON caches under `AltisASO/` beside the store, keyed by
 `"<keyword>:<COUNTRY>"`. `includeMetrics` merges them.
 
-The server's own data (rank checks, suggestion cache, jobs) lives in
-`~/Library/Application Support/altis-mcp/screen.sqlite`. Jobs run inside the
+The server's own data (rank checks, suggestion cache, jobs, candidates, and the
+shared Apple limiter state) lives in
+`~/Library/Application Support/altis-mcp/screen.sqlite`. Every altis-mcp
+process on the machine claims its next Apple call slot in that file, so several
+sessions and workers pace against one budget (see `docs/adr/0001`). Jobs run inside the
 server process and keep running after the client that started them
 disconnects; their state is written to the store on every step, so any later
 client (or a restarted server) can read status and results. A job whose

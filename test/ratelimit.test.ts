@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { AppleRateLimiter, parseRetryAfter } from "../dist/ratelimit.js";
+import { AppleRateLimiter, DEFAULT_SEARCH_PACE_MS, SUCCESSES_TO_RESET, parseRetryAfter } from "../dist/ratelimit.js";
 
 function fakeClock() {
   let t = 1_000_000;
@@ -33,7 +33,7 @@ test("acquire paces calls by the minimum interval", async () => {
   assert.equal(l.status().callsLastMinute.search, 2);
 });
 
-test("rate limit arms exponential backoff, Retry-After wins, success resets", async () => {
+test("rate limit arms exponential backoff, Retry-After wins, ladder resets only after N clean calls", async () => {
   const c = fakeClock();
   const l = new AppleRateLimiter({ paceMs: 0, now: c.now, sleep: c.sleep, initialBackoffMs: 60_000 });
   assert.equal(l.recordRateLimit("search", 403, null), 60);
@@ -42,18 +42,54 @@ test("rate limit arms exponential backoff, Retry-After wins, success resets", as
   assert.deepEqual(c.sleeps, [60_000]);
   assert.equal(l.recordRateLimit("search", 403, null), 120);
   assert.equal(l.recordRateLimit("search", 429, "5"), 5);
+  c.advance(5_000);
+  for (let i = 0; i < SUCCESSES_TO_RESET - 1; i++) l.recordSuccess("search");
+  assert.equal(l.status().consecutiveRateLimits, 3, "one success short: ladder still armed");
+  assert.equal(l.status().successesSinceRateLimit, SUCCESSES_TO_RESET - 1);
   l.recordSuccess("search");
-  assert.equal(l.status().currentBackoffSeconds, 0);
   assert.equal(l.status().consecutiveRateLimits, 0);
   assert.equal(l.status().nextBackoffSeconds, 60);
 });
 
-test("backoff is capped", () => {
+test("backoff is capped at 300 s by default", () => {
   const c = fakeClock();
-  const l = new AppleRateLimiter({ now: c.now, sleep: c.sleep, initialBackoffMs: 60_000, maxBackoffMs: 600_000 });
+  const l = new AppleRateLimiter({ now: c.now, sleep: c.sleep });
   let last = 0;
   for (let i = 0; i < 8; i++) last = l.recordRateLimit("search", 403, null);
-  assert.equal(last, 600);
+  assert.equal(last, 300);
+  assert.equal(DEFAULT_SEARCH_PACE_MS, 1500);
+});
+
+test("adaptive pace: each 403 raises the floor 50%, capped at 4x, for the rest of the process", async () => {
+  const c = fakeClock();
+  const l = new AppleRateLimiter({ paceMs: 1000, now: c.now, sleep: c.sleep, initialBackoffMs: 0 });
+  assert.equal(l.effectivePace(), 1000);
+  l.recordRateLimit("search", 403, "0");
+  assert.equal(l.effectivePace(), 1500);
+  l.recordRateLimit("search", 403, "0");
+  assert.equal(l.effectivePace(), 2250);
+  for (let i = 0; i < 10; i++) l.recordRateLimit("search", 403, "0");
+  assert.equal(l.effectivePace(), 4000, "capped at 4x");
+  for (let i = 0; i < 20; i++) l.recordSuccess("search");
+  assert.equal(l.effectivePace(), 4000, "successes reset the ladder, not the multiplier");
+  assert.equal(l.status().adaptiveMultiplier, 4);
+  assert.equal(l.status().effectivePaceMs, 4000);
+  // acquire paces by the effective pace
+  await l.acquire("search");
+  await l.acquire("search");
+  assert.equal(c.sleeps.at(-1), 4000);
+});
+
+test("per-call pace can only raise the floor, never lower it", async () => {
+  const c = fakeClock();
+  const l = new AppleRateLimiter({ paceMs: 1500, now: c.now, sleep: c.sleep });
+  assert.equal(l.effectivePace(500), 1500);
+  assert.equal(l.effectivePace(3200), 3200);
+  await l.acquire("search", { paceMs: 500 });
+  await l.acquire("search", { paceMs: 500 });
+  assert.deepEqual(c.sleeps, [1500]);
+  await l.acquire("search", { paceMs: 3200 });
+  assert.equal(c.sleeps.at(-1), 3200);
 });
 
 test("acquire respects abort", async () => {

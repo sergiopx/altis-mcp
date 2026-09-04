@@ -75,6 +75,25 @@ type Row = Record<string, unknown>;
 
 export type JobStatus = "running" | "done" | "aborted" | "cancelled" | "failed";
 
+/**
+ * candidate: expanded and selected, no rank check requested (expand-only jobs).
+ * truncated: expanded but cut by maxCandidates. pending: awaiting a rank check.
+ * skipped: a fresh stored check was reused. done / error / cancelled: check outcome.
+ */
+export type CandidateStatus = "candidate" | "truncated" | "pending" | "skipped" | "done" | "error" | "cancelled";
+export type CandidateSource = "seed" | "autocomplete" | "combo";
+
+export interface JobCandidateRow {
+  term: string;
+  country: string;
+  status: CandidateStatus;
+  source: CandidateSource | null;
+  seed: string | null;
+  position: number | null;
+  error: string | null;
+  updatedAt: string;
+}
+
 export interface JobRecord {
   id: string;
   kind: "screen" | "batch";
@@ -144,6 +163,14 @@ export class ScreenStore {
       );
       CREATE INDEX IF NOT EXISTS job_candidates_status ON job_candidates(job_id, status);
     `);
+    this.migrate();
+  }
+
+  /** Additive schema changes for stores created by older versions. */
+  private migrate(): void {
+    const cols = new Set((this.db.prepare("PRAGMA table_info(job_candidates)").all() as Row[]).map((r) => r.name as string));
+    if (!cols.has("source")) this.db.exec("ALTER TABLE job_candidates ADD COLUMN source TEXT");
+    if (!cols.has("seed")) this.db.exec("ALTER TABLE job_candidates ADD COLUMN seed TEXT");
   }
 
   close(): void {
@@ -320,18 +347,34 @@ export class ScreenStore {
     return this.db.prepare("UPDATE jobs SET cancel_requested = 1 WHERE id = ?").run(id).changes > 0;
   }
 
+  /** Merge fields into a job's stored input (e.g. a pace change); the owning worker re-reads it at its next step. */
+  updateJobInput(id: string, patch: Record<string, unknown>): boolean {
+    const rec = this.getJob(id);
+    if (!rec) return false;
+    const input = { ...(rec.input as Record<string, unknown>), ...patch };
+    return this.db.prepare("UPDATE jobs SET input = ? WHERE id = ?").run(JSON.stringify(input), id).changes > 0;
+  }
+
   jobCancelRequested(id: string): boolean {
     const r = this.db.prepare("SELECT cancel_requested AS c FROM jobs WHERE id = ?").get(id) as Row | undefined;
     return r?.c === 1;
   }
 
-  addJobCandidate(jobId: string, term: string, country: string, status: "pending" | "skipped"): boolean {
+  /**
+   * Insert a candidate row, or promote an existing `candidate` row to the given
+   * status (expansion stores every candidate first; selection turns the chosen
+   * ones into pending/skipped). Returns false when the row already had a final status.
+   */
+  addJobCandidate(jobId: string, term: string, country: string, status: CandidateStatus, source?: CandidateSource, seed?: string): boolean {
     return (
       this.db
         .prepare(
-          `INSERT OR IGNORE INTO job_candidates (job_id, term, country, status, updated_at) VALUES (?, ?, ?, ?, ?)`,
+          `INSERT INTO job_candidates (job_id, term, country, status, source, seed, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(job_id, term, country) DO UPDATE SET status = excluded.status, updated_at = excluded.updated_at,
+             source = COALESCE(job_candidates.source, excluded.source), seed = COALESCE(job_candidates.seed, excluded.seed)
+           WHERE job_candidates.status = 'candidate' AND excluded.status <> 'candidate'`,
         )
-        .run(jobId, term.toLowerCase(), country.toUpperCase(), status, new Date().toISOString()).changes > 0
+        .run(jobId, term.toLowerCase(), country.toUpperCase(), status, source ?? null, seed ?? null, new Date().toISOString()).changes > 0
     );
   }
 
@@ -341,6 +384,22 @@ export class ScreenStore {
       .run(status, position, error ?? null, new Date().toISOString(), jobId, term.toLowerCase(), country.toUpperCase());
   }
 
+  /** Move every `candidate` row of the given terms (all countries) to `truncated`. */
+  markTruncated(jobId: string, terms: string[]): number {
+    const stmt = this.db.prepare(`UPDATE job_candidates SET status = 'truncated', updated_at = ? WHERE job_id = ? AND term = ? AND status = 'candidate'`);
+    const now = new Date().toISOString();
+    let n = 0;
+    this.db.exec("BEGIN");
+    try {
+      for (const t of terms) n += Number(stmt.run(now, jobId, t.toLowerCase()).changes);
+      this.db.exec("COMMIT");
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
+    return n;
+  }
+
   /** Mark every still-pending candidate of a job (e.g. after a cancel or abort). */
   finishPendingCandidates(jobId: string, status: "cancelled" | "error", error: string): number {
     return Number(
@@ -348,6 +407,42 @@ export class ScreenStore {
         .prepare(`UPDATE job_candidates SET status = ?, error = ?, updated_at = ? WHERE job_id = ? AND status = 'pending'`)
         .run(status, error, new Date().toISOString(), jobId).changes,
     );
+  }
+
+  listJobCandidates(jobId: string, f: { status?: CandidateStatus; limit?: number; offset?: number } = {}): { total: number; candidates: JobCandidateRow[] } {
+    const where = ["job_id = ?"];
+    const params: (string | number)[] = [jobId];
+    if (f.status) {
+      where.push("status = ?");
+      params.push(f.status);
+    }
+    const limit = Math.min(Math.max(f.limit ?? 500, 1), 20000);
+    const offset = Math.max(f.offset ?? 0, 0);
+    const total = (this.db.prepare(`SELECT COUNT(*) AS c FROM job_candidates WHERE ${where.join(" AND ")}`).get(...params) as Row).c as number;
+    const rows = this.db
+      .prepare(`SELECT * FROM job_candidates WHERE ${where.join(" AND ")} ORDER BY seed, source, term, country LIMIT ? OFFSET ?`)
+      .all(...params, limit, offset) as Row[];
+    return {
+      total,
+      candidates: rows.map((r) => ({
+        term: r.term as string,
+        country: r.country as string,
+        status: r.status as CandidateStatus,
+        source: (r.source as CandidateSource | null) ?? null,
+        seed: (r.seed as string | null) ?? null,
+        position: (r.position as number | null) ?? null,
+        error: (r.error as string | null) ?? null,
+        updatedAt: r.updated_at as string,
+      })),
+    };
+  }
+
+  /** Per-seed counts of a status (e.g. how many of each seed's candidates were truncated). */
+  candidateCountsBySeed(jobId: string, status: CandidateStatus): Record<string, number> {
+    const rows = this.db
+      .prepare("SELECT COALESCE(seed, '') AS seed, COUNT(DISTINCT term) AS n FROM job_candidates WHERE job_id = ? AND status = ? GROUP BY seed ORDER BY n DESC")
+      .all(jobId, status) as Row[];
+    return Object.fromEntries(rows.map((r) => [r.seed as string, r.n as number]));
   }
 
   jobCandidateCounts(jobId: string): Record<string, number> {
