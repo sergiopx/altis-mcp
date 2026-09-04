@@ -49,7 +49,7 @@ Environment variables:
 | `ALTIS_STORE_PATH` | Altis container `default.store` | Altis SQLite store to read |
 | `ALTIS_METRICS_DIR` | `AltisASO/` beside the store | Altis JSON caches (metrics, competitors, intent, opportunity) |
 | `ALTIS_MCP_DATA_DIR` | `~/Library/Application Support/altis-mcp` | Server-owned screening store and autocomplete cache |
-| `ALTIS_MCP_PACE_SEARCH_MS` | `1200` | Minimum spacing between search/lookup calls (rank checks, SERPs) |
+| `ALTIS_MCP_PACE_SEARCH_MS` | `1500` | Minimum spacing between search/lookup calls (rank checks, SERPs) |
 | `ALTIS_MCP_PACE_SUGGEST_MS` | `600` | Minimum spacing between autocomplete calls |
 
 ## Tools

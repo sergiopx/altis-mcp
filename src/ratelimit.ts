@@ -13,7 +13,7 @@
  */
 
 export const DEFAULT_PACE_MS = 3000;
-export const DEFAULT_SEARCH_PACE_MS = 1200;
+export const DEFAULT_SEARCH_PACE_MS = 1500; // 40 calls/min: measured 2026-09-03 (60/min 403s under sustained load, 40/min never did)
 export const DEFAULT_SUGGEST_PACE_MS = 600;
 export const DEFAULT_INITIAL_BACKOFF_MS = 60_000;
 export const DEFAULT_MAX_BACKOFF_MS = 600_000;

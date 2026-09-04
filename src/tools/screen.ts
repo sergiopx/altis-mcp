@@ -29,7 +29,7 @@ export function registerScreenTools(server: McpServer): void {
         maxCandidates: z.number().int().min(1).max(20000).optional().default(1000),
         rescreenAfterDays: z.number().min(0).optional().default(7).describe("Reuse stored rank checks newer than this"),
         depth: z.number().int().min(10).max(200).optional().default(200),
-        searchPaceMs: z.number().int().min(0).max(60_000).optional().describe("Spacing between search calls for this job (default 1200)"),
+        searchPaceMs: z.number().int().min(0).max(60_000).optional().describe("Spacing between search calls for this job (default 1500)"),
         suggestPaceMs: z.number().int().min(0).max(60_000).optional().describe("Spacing between autocomplete calls for this job (default 600)"),
         expandOnly: z.boolean().optional().default(false).describe("Stop after expansion/filtering; no rank checks"),
         async: z.boolean().optional().default(true).describe("Return a jobId immediately (default) or block until done"),
